@@ -155,7 +155,11 @@ def main() -> None:
         agg = {"loss": 0.0, "loss_ar": 0.0, "loss_flow": 0.0, "fast_acc": 0.0}
         for _ in range(tc.grad_accum):
             batch = next_batch()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            # cache_enabled=False is REQUIRED: the no_grad KV export in llm_forward would otherwise
+            # populate the autocast weight cache with grad-disconnected bf16 casts, breaking the
+            # checkpointed layer forwards (CheckpointError in backward / missing k,v,norm grads).
+            # Costs ~nothing: each weight is cast once per micro-forward either way.
+            with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
                 out = vla.forward_train(batch)
             (out["loss"] / tc.grad_accum).backward()
             for k in agg:

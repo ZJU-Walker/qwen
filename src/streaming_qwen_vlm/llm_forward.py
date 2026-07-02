@@ -72,7 +72,23 @@ def forward_train(
     Returns (prefix_kv, hidden_states after the final norm — feed to lm_head for the AR loss).
     Per-layer gradient checkpointing works untouched: layers are GradientCheckpointingLayer and
     self-checkpoint when model.gradient_checkpointing_enable() was called and the model is training.
+
+    MUST run under ``torch.autocast(..., cache_enabled=False)`` when training: the no_grad KV
+    export below calls k_proj/v_proj/input_layernorm before each layer's forward, and with the
+    autocast weight cache enabled those casts (created under no_grad, hence grad-disconnected)
+    would be reused by the layer itself — CheckpointError on backward and silently missing
+    k/v/norm gradients. Verified by minimal repro; the guard below makes the failure actionable.
     """
+    if (
+        torch.is_grad_enabled()
+        and torch.is_autocast_enabled("cuda")
+        and torch.is_autocast_cache_enabled()
+    ):
+        raise RuntimeError(
+            "forward_train requires torch.autocast(..., cache_enabled=False): the no_grad KV "
+            "export would poison the autocast weight cache with grad-disconnected casts "
+            "(CheckpointError in backward; k/v/norm weights get no gradient)."
+        )
     lm = model.model.language_model
     cfg = lm.config
     mrope_section = cfg.rope_scaling["mrope_section"]
