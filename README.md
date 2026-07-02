@@ -119,49 +119,76 @@ Implements the locked design in `claude_plan.md` (D1–D8), π0.5-faithful:
 - **Deviations from claude_plan.md** (deliberate): vocab side-car instead of resize; hold-pose
   padding instead of loss masks; EMA on expert only; t≥10 sampling floor; adaRMS final norm.
 
-## One-time setup (H200)
+## Run order (all commands assume `conda activate qwen3vl` first)
+
+Every block below also assumes:
 
 ```bash
-/iris/u/kewalk/.conda/envs/qwen3vl/bin/pip install scipy wandb protobuf
-/iris/u/kewalk/.conda/envs/qwen3vl/bin/python -c "from transformers import AutoProcessor; p=AutoProcessor.from_pretrained('physical-intelligence/fast', trust_remote_code=True); print(p.vocab_size)"
-/iris/u/kewalk/.conda/envs/qwen3vl/bin/wandb login
+cd /iris/projects/humanoid/qwen
+export PYTHONPATH=src:.
 ```
 
-## M1 gates (user-run; PY=/iris/u/kewalk/.conda/envs/qwen3vl/bin/python, from the repo root, PYTHONPATH=src)
+### Step 0 — one-time setup (H200, needs internet)
 
 ```bash
-$PY -m streaming_qwen_vlm.normalize --root /iris/projects/humanoid/trossen_data/0528_merge_block_mem --out checkpoints/norm_stats.json
-$PY -m streaming_qwen_vlm.fast_tokens --measure --stats checkpoints/norm_stats.json   # freeze max_fast_tokens
-$PY -m pytest tests/test_front_padding.py tests/test_fast_roundtrip.py -v -s          # CPU-ok
-$PY -m pytest tests/test_kv_export_equivalence.py tests/test_dataloader_streaming_parity.py -v -s   # H200
-$PY -m pytest tests/test_output_shape.py tests/test_sliding_window.py -v -s           # updated Stage-1
+pip install scipy wandb protobuf
+# download the FAST tokenizer (prints its vocab size; ~small download, cached under ~/.cache/huggingface)
+python -c "from transformers import AutoProcessor; p=AutoProcessor.from_pretrained('physical-intelligence/fast', trust_remote_code=True); print(p.vocab_size)"
+wandb login
 ```
 
-## M2 gates
+### Step 1 — M1 gates (data/interface layer)
 
 ```bash
-$PY -m pytest tests/test_expert_attention.py tests/test_expert_init.py -v -s          # CPU-ok
-$PY -m streaming_qwen_vlm.training.train --overfit-episode 0 --steps 2000 --out-dir checkpoints/overfit
-$PY examples/replay_policy.py --checkpoint checkpoints/overfit/step_002000 --episode 0
+# 1. compute q01/q99 normalization stats on the train split (writes checkpoints/norm_stats.json)
+python -m streaming_qwen_vlm.normalize --root /iris/projects/humanoid/trossen_data/0528_merge_block_mem --out checkpoints/norm_stats.json
+
+# 2. measure FAST tokens/chunk (confirm max <= 128, else raise max_fast_tokens in config)
+python -m streaming_qwen_vlm.fast_tokens --measure --stats checkpoints/norm_stats.json
+
+# 3. tests — CPU-ok (front-padding semantics; FAST round-trip needs the step-0 download)
+python -m pytest tests/test_front_padding.py tests/test_fast_roundtrip.py -v -s
+
+# 4. tests — need the H200 (loads the 3B model): KV export + dataloader<->streaming parity
+python -m pytest tests/test_kv_export_equivalence.py tests/test_dataloader_streaming_parity.py -v -s
+
+# 5. updated Stage-1 tests (emit-from-tick-0)
+python -m pytest tests/test_output_shape.py tests/test_sliding_window.py -v -s
 ```
 
-Overfit gate passes when FAST token accuracy → ~1.0, val open-loop MSE ≈ 0, and the replay curves
-track the demo.
-
-## M3 — full training (~30k steps, 1–3 days)
+### Step 2 — M2 gates (model)
 
 ```bash
-$PY -m streaming_qwen_vlm.training.train --out-dir checkpoints/run1     # wandb project qwen-vla
-# resume: add --resume ; fallback width: --expert-width 768
+# 1. expert unit tests (CPU-ok)
+python -m pytest tests/test_expert_attention.py tests/test_expert_init.py -v -s
+
+# 2. overfit-one-episode gate (H200, ~2k steps)
+python -m streaming_qwen_vlm.training.train --overfit-episode 0 --steps 2000 --out-dir checkpoints/overfit
+
+# 3. visual check: replay the overfit policy on the same episode
+python examples/replay_policy.py --checkpoint checkpoints/overfit/step_002000 --episode 0
 ```
 
-## M4 — deployment
+Gate passes when FAST token accuracy → ~1.0, val open-loop MSE ≈ 0, and the replay curves track
+the demo.
+
+### Step 3 — M3 full training (H200, ~30k steps, 1–3 days)
 
 ```bash
-# H200: action server (mutually exclusive with the Stage-1 feature modes)
-$PY realtime/server.py --host 0.0.0.0 --port 8000 --checkpoint checkpoints/run1/step_030000
-# robot workstation: 30 Hz executor, 20-of-30 chunk execution (dry-run without --execute)
-python realtime/client.py --policy_host <H200-host> --port 8000 --mode act [--execute]
+python -m streaming_qwen_vlm.training.train --out-dir checkpoints/run1     # wandb project qwen-vla
+# resume after interruption:  add --resume
+# overfitting fallback:       add --expert-width 768
+```
+
+### Step 4 — M4 deployment
+
+```bash
+# H200: action server (with --checkpoint it serves actions, not context features)
+python realtime/server.py --host 0.0.0.0 --port 8000 --checkpoint checkpoints/run1/step_030000
+
+# robot workstation (its own env, needs openpi_client): dry-run first, add --execute to actuate
+python realtime/client.py --policy_host <H200-host> --port 8000 --mode act
+python realtime/client.py --policy_host <H200-host> --port 8000 --mode act --execute
 ```
 
 Per tick: pair encode → state-in-prompt → 36-layer prefill (KV export, once) → 10 expert Euler
