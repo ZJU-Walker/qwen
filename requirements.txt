@@ -1,0 +1,12 @@
+# This package targets the prebuilt conda env (do NOT pip install into a fresh env):
+#   /iris/u/kewalk/.conda/envs/qwen3vl/bin/python
+# The versions below document what that env provides and were verified on the H200 node.
+torch==2.6.0
+transformers==4.57.6
+qwen-vl-utils==0.0.14
+accelerate==1.7.0
+flash-attn==2.7.4
+av==17.0.0
+torchvision==0.21.0
+numpy>=2.0
+pytest>=8.0

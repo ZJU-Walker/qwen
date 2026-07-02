@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streaming_qwen_vlm"
+version = "0.1.0"
+description = "Streaming Qwen2.5-VL-3B VLM context-feature module for a robotics VLA (Stage 1)"
+requires-python = ">=3.11"
+# NOTE: Do not install deps from here. Use the prebuilt conda env:
+#   /iris/u/kewalk/.conda/envs/qwen3vl/bin/python
+# See requirements.txt for the pinned versions that env provides.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
