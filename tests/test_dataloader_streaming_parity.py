@@ -4,9 +4,10 @@ For a real episode and several control steps t (including front-padded early tic
 - pair frame indices + processed pixel tensors are BIT-EXACT between TrossenActDataset and a
   simulated streaming feed (both run the same prepare_frames + pair_to_pixel_values);
 - window features agree between the dataset's batched ViT call (all 15 pair grid rows at once)
-  and the streaming PairVisionCache sequential encode + front-padded concat, to bf16 kernel
-  tolerance (batched vs sequential GEMMs; the blocked vision attention makes them structurally
-  equivalent — Stage-1 test #2);
+  and the streaming PairVisionCache sequential encode + front-padded concat. GATED IN FP32
+  (mirrors test_vision_cache_equivalence): bf16 kernel accumulation legitimately produces
+  max-abs diffs of O(1) on these large-magnitude features at cosine ~0.999, so bf16 numbers are
+  logged, not asserted;
 - state bins and the hold-pose-padded action chunk match a hand computation.
 
 Needs the real model (H200) + the Trossen dataset. The FAST tokenizer is stubbed out — this test
@@ -25,16 +26,20 @@ from streaming_qwen_vlm.preprocess import pair_to_pixel_values, prepare_frames
 from streaming_qwen_vlm.state_text import bins_to_ids, build_state_lut
 from streaming_qwen_vlm.training.dataset import (
     FRAME_STRIDE,
+    MIN_T,
     TICK_STRIDE,
     TrossenActDataset,
     pair_frame_indices,
 )
 from streaming_qwen_vlm.vision_cache import PairVisionCache
+from .test_vision_cache_equivalence import _visual_in_fp32
 
 ROOT = "/iris/projects/humanoid/trossen_data/0528_merge_block_mem"
 EPISODE = 0
 T_VALUES = [10, 25, 50, 131]  # includes heavily front-padded early ticks
-FEATURE_TOL = 2e-2            # bf16 batched-vs-sequential kernel noise
+# fp32 gating tolerances, same as test_vision_cache_equivalence (observed fp32 max ~1.4e-4)
+FP32_MAX_TOL = 1e-3
+FP32_MEAN_TOL = 1e-5
 MAX_FAST = 16
 
 pytestmark = pytest.mark.skipif(not os.path.isdir(ROOT), reason=f"dataset not found at {ROOT}")
@@ -98,32 +103,46 @@ def test_pixel_and_lowdim_parity(dataset, cfg, processor, t):
 
 @pytest.mark.parametrize("t", [10, 131])
 def test_feature_parity_batched_vs_streaming(dataset, cfg, model, t):
+    """GATING (fp32): dataset's one batched ViT call == streaming sequential encode + front-pad."""
     item = dataset[dataset.samples.index((EPISODE, t))]
     device = model.device
-
-    # Streaming: sequential per-pair encode + front-padded concat (the deployment path).
-    cache = PairVisionCache(cfg.num_pairs, cfg.tokens_per_pair)
-    k_max = (t - 10) // TICK_STRIDE
+    ks = pair_frame_indices(t, cfg.num_pairs)
+    k_max = (t - MIN_T) // TICK_STRIDE
     per_pair = item["pixel_values"].view(cfg.num_pairs, -1, item["pixel_values"].shape[-1])
     grid1 = torch.tensor([list(cfg.pair_grid_thw)], dtype=torch.long)
-    seen = set()
-    for k, pv in zip(pair_frame_indices(t, cfg.num_pairs), per_pair):
-        if k in seen:
-            continue
-        seen.add(k)
-        cache.push(cache.encode_pair(model, pv, grid1).to(model.dtype))
-    assert len(cache) == min(k_max + 1, cfg.num_pairs)
-    streamed = cache.concat(pad_to_full=True)  # [2160, 2048]
+    grid_all = torch.tensor([list(cfg.pair_grid_thw)] * cfg.num_pairs, dtype=torch.long)
 
-    # Dataset/training: ONE batched ViT call over all 15 grid rows.
-    with torch.inference_mode():
-        grid = torch.tensor([list(cfg.pair_grid_thw)] * cfg.num_pairs, dtype=torch.long)
-        feats = model.get_video_features(item["pixel_values"].to(device), grid.to(device))
-        batched = torch.cat(list(feats), dim=0)
+    @torch.inference_mode()
+    def encode_both():
+        # Streaming: sequential per-pair encode + front-padded concat (the deployment path).
+        cache = PairVisionCache(cfg.num_pairs, cfg.tokens_per_pair)
+        seen = set()
+        for k, pv in zip(ks, per_pair):
+            if k in seen:
+                continue
+            seen.add(k)
+            cache.push(cache.encode_pair(model, pv, grid1))  # keep the tower's compute dtype
+        assert len(cache) == min(k_max + 1, cfg.num_pairs)
+        streamed = cache.concat(pad_to_full=True)  # [2160, 2048]
+        # Dataset/training: ONE batched ViT call over all 15 grid rows.
+        feats = model.get_video_features(item["pixel_values"].to(device), grid_all.to(device))
+        return streamed, torch.cat(list(feats), dim=0)
 
-    diff = (streamed.float() - batched.float()).abs().max().item()
+    # bf16 diff is logged only: kernel accumulation gives max-abs O(1) at cosine ~0.999 on these
+    # large-magnitude features (cf. Stage-1 test #2: bf16 max ~7.8 vs fp32 max ~1.4e-4).
+    s16, b16 = encode_both()
+    bf16_max = (s16.float() - b16.float()).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        streamed.float().flatten(), batched.float().flatten(), dim=0
+        s16.float().flatten(), b16.float().flatten(), dim=0
     ).item()
-    print(f"\nt={t}: batched vs streaming features: max abs diff {diff:.3e}, cosine {cos:.6f}")
-    assert diff <= FEATURE_TOL and cos >= 0.999, f"t={t}: diff={diff:.3e} cos={cos:.6f}"
+
+    with _visual_in_fp32(model):
+        streamed, batched = encode_both()
+    diff = (streamed - batched).abs()
+    max_abs, mean_abs = diff.max().item(), diff.mean().item()
+    print(f"\nt={t}: fp32 max={max_abs:.3e} mean={mean_abs:.3e} | bf16 max={bf16_max:.3e} cos={cos:.6f}")
+    assert max_abs <= FP32_MAX_TOL and mean_abs <= FP32_MEAN_TOL, (
+        f"t={t}: batched-vs-streaming ViT features differ in fp32 "
+        f"(max={max_abs:.3e} tol {FP32_MAX_TOL:.0e}, mean={mean_abs:.3e} tol {FP32_MEAN_TOL:.0e}) "
+        f"— structural parity broken, not a precision issue"
+    )
