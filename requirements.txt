@@ -10,3 +10,9 @@ av==17.0.0
 torchvision==0.21.0
 numpy>=2.0
 pytest>=8.0
+# --- Stage 2 additions (install into the same env: pip install scipy wandb protobuf) ---
+pyarrow>=24.0        # LeRobot parquet loading (already in the env)
+scipy               # FAST tokenizer DCT
+wandb               # training metrics (user choice; falls back to metrics.jsonl if absent)
+protobuf            # tokenizer slow-path safety
+

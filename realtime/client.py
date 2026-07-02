@@ -55,6 +55,12 @@ class RobotCamera:
         img = self._cv2.resize(img, (self.send_res, self.send_res))
         return img.astype(np.uint8), state
 
+    def act(self, action: np.ndarray):
+        """Send one absolute joint-target action [14] to the robot."""
+        import torch
+
+        self.robot.send_action(torch.from_numpy(np.asarray(action, dtype=np.float32)))
+
     def close(self):
         self.robot.disconnect()
 
@@ -176,12 +182,75 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
             cv2.destroyAllWindows()
 
 
+def run_act(client, cam, execute: bool, control_hz: float = 30.0, exec_per_tick: int = 20):
+    """Stage-2 VLA loop against a --checkpoint server (mode 'act').
+
+    30 Hz executor; every ``exec_per_tick`` control steps a tick fires: the 2 newest frames
+    (captured 1/3 s apart, matching the training pair grid) + current state go to the server in a
+    background thread; the previous [30,14] chunk keeps executing meanwhile. On chunk arrival the
+    playback index starts at the request-to-arrival latency in control steps (the 10-action tail is
+    the late-tick buffer). Without --execute, actions are printed, not sent.
+    """
+    import threading
+
+    period = 1.0 / control_hz
+    client.infer({"mode": "reset"})
+    print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz "
+          f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'}). Ctrl-C to stop.")
+
+    result = {}  # cross-thread: {"resp": dict, "t_sent": float}
+    lock = threading.Lock()
+
+    def request(frames, state, t_sent):
+        t0 = time.perf_counter()
+        resp = client.infer({"mode": "act", "frames": frames, "state": state})
+        with lock:
+            result["resp"], result["t_sent"], result["rtt"] = resp, t_sent, (time.perf_counter() - t0) * 1e3
+
+    chunk, idx, frame_a, tick = None, 0, None, 0
+    try:
+        i = 0
+        while True:
+            t_iter = time.perf_counter()
+            if i % exec_per_tick == exec_per_tick // 2:      # mid-tick: capture the pair's first frame
+                frame_a, _ = cam.capture()
+            if i % exec_per_tick == 0:                        # tick: capture second frame + state, fire request
+                frame_b, state = cam.capture()
+                fa = frame_a if frame_a is not None else frame_b
+                threading.Thread(target=request, daemon=True,
+                                 args=(np.stack([fa, frame_b]), state, time.perf_counter())).start()
+                tick += 1
+            with lock:
+                resp = result.pop("resp", None)
+                if resp is not None:
+                    late = int(round((time.perf_counter() - result.pop("t_sent")) * control_hz))
+                    chunk, idx = np.asarray(resp["actions"]), min(late, 9)
+                    print(f"tick {tick:4d}  rtt={result.pop('rtt'):6.1f}ms  "
+                          f"(vis={resp['vision_ms']:.0f} prefill={resp['prefill_ms']:.0f} "
+                          f"denoise={resp['denoise_ms']:.0f})  start_idx={idx}  "
+                          f"pairs={resp.get('num_pairs', '?')}/15")
+            if chunk is not None:
+                action = chunk[min(idx, len(chunk) - 1)]
+                idx += 1
+                if execute:
+                    cam.act(action)
+                elif i % exec_per_tick == 0:
+                    print(f"    action[0:4]={np.round(action[:4], 3).tolist()} ...")
+            i += 1
+            time.sleep(max(0.0, period - (time.perf_counter() - t_iter)))
+    except KeyboardInterrupt:
+        print("\nstopped.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy_host", required=True, help="H200 server host")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--mode", default="cached", choices=["cached", "full", "sweep"],
-                    help="cached/full = live loop (window + per-step latency); sweep = timed table over modes x layers")
+    ap.add_argument("--mode", default="cached", choices=["cached", "full", "sweep", "act"],
+                    help="cached/full = live feature loop; sweep = timed table over modes x layers; "
+                         "act = VLA action-chunk execution against a --checkpoint server")
+    ap.add_argument("--execute", action="store_true",
+                    help="act mode: actually send actions to the robot (default: dry-run print)")
     ap.add_argument("--layers", type=int, default=16, help="early-exit depth for live mode")
     ap.add_argument("--no_viz", action="store_true", help="live mode: print latency only, no window")
     ap.add_argument("--steps", type=int, default=50, help="sweep mode: timed steps per cell")
@@ -196,6 +265,15 @@ def main():
     print("connected; server metadata:", meta)
 
     cam = RobotCamera(args.send_res)
+
+    if args.mode == "act":
+        if meta.get("serves") != "actions":
+            print("WARNING: server is not serving actions — start it with --checkpoint.")
+        try:
+            run_act(client, cam, execute=args.execute)
+        finally:
+            cam.close()
+        return
 
     if args.mode != "sweep":
         try:

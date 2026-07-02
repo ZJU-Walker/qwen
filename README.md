@@ -42,13 +42,12 @@ cfg = VLMConfig(num_llm_layers_to_run=16)   # early-exit depth (1..36)
 vlm = StreamingQwenVLM(cfg)
 
 state = np.zeros(cfg.state_dim, dtype=np.float32)
-out = None
-# Feed two new frames per step; returns None during warm-up until the 30-frame window fills.
+# Feed two new frames per step. Output from tick 0: until the 30-frame window fills, it is
+# front-padded by repeating the oldest pair (Stage-2 D6; no more warm-up None phase).
 for pair in stream_of_frame_pairs:           # each pair: [frame_a, frame_b] HxWx3 uint8 RGB
     out = vlm.step(pair, state)
-    if out is not None:
-        ctx = out.context_tokens              # [1, S, 2048]; S = 2160 + instr_len + num_state_tokens
-        # out.token_types: 0=text, 1=video, 2=state ; out.context_mask: [1, S]
+    ctx = out.context_tokens                  # [1, S, 2048]; S = 2160 + instr_len + num_state_tokens
+    # out.token_types: 0=text, 1=video, 2=state ; out.context_mask: [1, S]
 ```
 
 Context-token layout is `[video | instruction | state]` (documented in `model.py`).
@@ -95,3 +94,76 @@ cd /iris/projects/humanoid/qwen && PYTHONPATH=src \
 
 Sweeps `N ∈ {8,12,16,24,36}` and writes `benchmark/results.md`. On the H200, all depths are far under
 the 667 ms / 1.5 Hz target (full 36 layers ≈ 64 ms ≈ 15.7 Hz; N=8 ≈ 46 ms ≈ 21.6 Hz), peak ≈ 7.5 GB.
+
+---
+
+# Stage 2 — VLA: joint-attention action expert + FAST AR training
+
+Implements the locked design in `claude_plan.md` (D1–D8), π0.5-faithful:
+
+- **Expert** (`expert.py`, `flow.py`): 36-layer / width-1024 parallel transformer; at every layer
+  the 30 noisy-action suffix tokens attend over `[prefix K_ℓ,V_ℓ (Qwen) ⊕ suffix K/V]` in one
+  softmax (heads 16/2/128 matched to Qwen). adaRMS(τ) with zero-init modulation; flow matching
+  (τ~Beta(1.5,1), 10 Euler steps). ≈850M params.
+- **KV export** (`llm_forward.py`): train-capable manual decoder loop; per-layer post-rope prefix
+  K/V recomputed from the layer inputs under `torch.no_grad()` — that IS the knowledge-insulation
+  boundary (backbone trains only via the AR loss). `early_exit.py` untouched (ablations).
+- **Prompt** (`prompt_builder.build_act_template`): `[scaffold | 2160 video | instruction |
+  "\nState:" | 56 state ids | assistant tail]` — state rendered as constant-length 3-digit bins
+  (`normalize.py`, `state_text.py`), so `S_prefix` is a project-wide constant. StateProjector retired
+  (`num_state_tokens=0`).
+- **FAST side-car** (`fast_tokens.py`, `vla.py`): Qwen vocab NOT resized (tied embeddings);
+  FAST ids live at `V_BASE+` with separate `fast_embed`/`fast_head`; `L = L_AR + L_flow`.
+- **Data** (`training/dataset.py`): any control step t≥10; pair grid = frames (20k, 20k+10);
+  windows front-padded identically to streaming; chunks `a[t:t+30]` hold-pose padded.
+- **Deviations from claude_plan.md** (deliberate): vocab side-car instead of resize; hold-pose
+  padding instead of loss masks; EMA on expert only; t≥10 sampling floor; adaRMS final norm.
+
+## One-time setup (H200)
+
+```bash
+/iris/u/kewalk/.conda/envs/qwen3vl/bin/pip install scipy wandb protobuf
+/iris/u/kewalk/.conda/envs/qwen3vl/bin/python -c "from transformers import AutoProcessor; p=AutoProcessor.from_pretrained('physical-intelligence/fast', trust_remote_code=True); print(p.vocab_size)"
+/iris/u/kewalk/.conda/envs/qwen3vl/bin/wandb login
+```
+
+## M1 gates (user-run; PY=/iris/u/kewalk/.conda/envs/qwen3vl/bin/python, from the repo root, PYTHONPATH=src)
+
+```bash
+$PY -m streaming_qwen_vlm.normalize --root /iris/projects/humanoid/trossen_data/0528_merge_block_mem --out checkpoints/norm_stats.json
+$PY -m streaming_qwen_vlm.fast_tokens --measure --stats checkpoints/norm_stats.json   # freeze max_fast_tokens
+$PY -m pytest tests/test_front_padding.py tests/test_fast_roundtrip.py -v -s          # CPU-ok
+$PY -m pytest tests/test_kv_export_equivalence.py tests/test_dataloader_streaming_parity.py -v -s   # H200
+$PY -m pytest tests/test_output_shape.py tests/test_sliding_window.py -v -s           # updated Stage-1
+```
+
+## M2 gates
+
+```bash
+$PY -m pytest tests/test_expert_attention.py tests/test_expert_init.py -v -s          # CPU-ok
+$PY -m streaming_qwen_vlm.training.train --overfit-episode 0 --steps 2000 --out-dir checkpoints/overfit
+$PY examples/replay_policy.py --checkpoint checkpoints/overfit/step_002000 --episode 0
+```
+
+Overfit gate passes when FAST token accuracy → ~1.0, val open-loop MSE ≈ 0, and the replay curves
+track the demo.
+
+## M3 — full training (~30k steps, 1–3 days)
+
+```bash
+$PY -m streaming_qwen_vlm.training.train --out-dir checkpoints/run1     # wandb project qwen-vla
+# resume: add --resume ; fallback width: --expert-width 768
+```
+
+## M4 — deployment
+
+```bash
+# H200: action server (mutually exclusive with the Stage-1 feature modes)
+$PY realtime/server.py --host 0.0.0.0 --port 8000 --checkpoint checkpoints/run1/step_030000
+# robot workstation: 30 Hz executor, 20-of-30 chunk execution (dry-run without --execute)
+python realtime/client.py --policy_host <H200-host> --port 8000 --mode act [--execute]
+```
+
+Per tick: pair encode → state-in-prompt → 36-layer prefill (KV export, once) → 10 expert Euler
+steps on the cached prefix K/V → `[30, 14]` absolute joint targets (~1.7 KB). Expected ≈105 ms
+per 667 ms tick.

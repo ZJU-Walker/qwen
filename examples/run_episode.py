@@ -1,8 +1,9 @@
 """Stream a real Trossen cam_high episode through StreamingQwenVLM.
 
 Reads the pre-extracted cam_high JPG frames + the 14-dim observation.state from the LeRobot-format
-dataset, subsamples a 30-frame window, and feeds it pair-by-pair to the streaming VLM. Prints the
-warm-up behaviour and the final context-token output.
+dataset, subsamples a 30-frame window, and feeds it pair-by-pair to the streaming VLM. Output is
+available from the first step (front-padded window, D6); prints per-step latency and the final
+context-token output.
 
 Example:
     cd /iris/projects/humanoid/qwen && PYTHONPATH=src \
@@ -109,11 +110,12 @@ def main():
         t0 = time.perf_counter()
         out = vlm.step([a, b], state)
         dt = (time.perf_counter() - t0) * 1000
-        status = "warm-up (None)" if out is None else "OUTPUT"
+        # Front-padding (D6): output at every step; early steps use a window padded with pair 0.
+        status = f"OUTPUT (pairs {min(i + 1, cfg.num_pairs)}/{cfg.num_pairs})"
         print(f"  step {i + 1:2d}/{n_pairs}  pair-frames=({idx[2*i]},{idx[2*i+1]})  {dt:6.1f} ms  -> {status}")
 
     if out is None:
-        print("\nWindow never filled (too few frames). Use --stride or a longer episode.")
+        print("\nNo pairs were fed (episode too short?).")
         return
 
     tt = out.token_types[0]

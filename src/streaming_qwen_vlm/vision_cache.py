@@ -39,11 +39,20 @@ class PairVisionCache:
         """Append a pair embedding; the deque auto-evicts the oldest when full."""
         self._buf.append(z)
 
-    def concat(self) -> torch.Tensor:
-        """Chronological [total_video_tokens, 2048] (oldest pair first)."""
+    def concat(self, pad_to_full: bool = False) -> torch.Tensor:
+        """Chronological [total_video_tokens, 2048] (oldest pair first).
+
+        With ``pad_to_full`` (Stage-2 D6 front-padding), a not-yet-full cache is left-padded by
+        repeating the OLDEST pair so output is available from the very first tick:
+        ``[pair_0 x (num_pairs - len), pair_0..pair_k]``. The training dataloader applies the
+        identical padding so streaming and training see bit-identical windows.
+        """
         if not self._buf:
             raise RuntimeError("PairVisionCache is empty; nothing to concat.")
-        return torch.cat(list(self._buf), dim=0)
+        pairs = list(self._buf)
+        if pad_to_full and len(pairs) < self.num_pairs:
+            pairs = [pairs[0]] * (self.num_pairs - len(pairs)) + pairs
+        return torch.cat(pairs, dim=0)
 
     def is_full(self) -> bool:
         return len(self._buf) == self.num_pairs

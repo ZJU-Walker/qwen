@@ -1,9 +1,11 @@
 """StreamingQwenVLM: the streaming Qwen2.5-VL-3B context-feature module.
 
 Per step it: encodes the newest 2-frame pair (cached), reconstructs the 30-frame window feature from
-the pair cache, injects it into the LLM input via masked_scatter (vision encoder NOT re-run), appends
-robot-state tokens, runs a configurable number of LLM layers (real early exit), and returns the
-context-token hidden states grouped as [video | instruction | state].
+the pair cache (front-padded with the oldest pair until the window fills — output from tick 0),
+injects it into the LLM input via masked_scatter (vision encoder NOT re-run), optionally appends
+robot-state tokens (Stage-1 ablation path; num_state_tokens defaults to 0), runs a configurable
+number of LLM layers (real early exit), and returns the context-token hidden states grouped as
+[video | instruction | state].
 """
 
 from __future__ import annotations
@@ -38,7 +40,11 @@ class StreamingQwenVLM:
 
         self.cache = PairVisionCache(cfg.num_pairs, cfg.tokens_per_pair)
         self.frame_buffer = RollingFrameBuffer(cfg.window_frames, cfg.frames_per_pair)
-        self.state_proj = StateProjector(cfg).to(self.device, self.dtype)
+        # Stage 2: state enters the prompt as text (num_state_tokens == 0); the Stage-1
+        # StateProjector token path is kept for ablations only.
+        self.state_proj = (
+            StateProjector(cfg).to(self.device, self.dtype) if cfg.num_state_tokens > 0 else None
+        )
 
         self.template: PromptTemplate = build_prompt(processor, cfg)
         self._input_ids = self.template.input_ids.to(self.device)
@@ -105,11 +111,10 @@ class StreamingQwenVLM:
     def step(self, new_two_frames: ArrayLike, robot_state: ArrayLike) -> Optional[VLMOutput]:
         cfg = self.cfg
         self._encode_and_push_pair(new_two_frames)
-        if not self.cache.is_full():
-            return None  # warm-up: window not yet full
 
-        # 1. Reconstruct the window feature from cached pair embeddings.
-        video_embeds = self.cache.concat().to(self.device, self.dtype)  # [total_video_tokens, 2048]
+        # 1. Reconstruct the window feature from cached pair embeddings. Until the cache fills,
+        #    the window is front-padded by repeating the oldest pair (D6) — output from tick 0.
+        video_embeds = self.cache.concat(pad_to_full=True).to(self.device, self.dtype)
 
         # 2. Build inputs_embeds and scatter the video features into the video_token_id slots.
         inputs_embeds = self.model.get_input_embeddings()(self._input_ids)  # [1, S_t, 2048]

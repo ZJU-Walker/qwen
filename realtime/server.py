@@ -55,9 +55,10 @@ class StreamingQwenVLMPolicy:
         inputs_embeds = inputs_embeds.masked_scatter(
             vlm._video_mask.unsqueeze(-1), video_embeds.to(vlm.device, vlm.dtype).reshape(-1)
         )
-        state_t = torch.as_tensor(np.asarray(state, dtype=np.float32))
-        state_tok = vlm.state_proj(state_t).to(vlm.device, vlm.dtype)
-        inputs_embeds = torch.cat([inputs_embeds, state_tok], dim=1)
+        if vlm.state_proj is not None:  # Stage-1 ablation path (num_state_tokens > 0)
+            state_t = torch.as_tensor(np.asarray(state, dtype=np.float32))
+            state_tok = vlm.state_proj(state_t).to(vlm.device, vlm.dtype)
+            inputs_embeds = torch.cat([inputs_embeds, state_tok], dim=1)
         return run_language_early_exit(
             vlm.model, inputs_embeds, vlm._attn_full, vlm._position_ids, num_layers, vlm.cfg.early_exit_norm
         )
@@ -70,11 +71,12 @@ class StreamingQwenVLMPolicy:
         with cuda_timer() as t_vis:
             z = vlm.cache.encode_pair(vlm.model, pinp["pixel_values_videos"], pinp["video_grid_thw"])
             vlm.cache.push(z.to(vlm.dtype))
-        if not vlm.cache.is_full():
-            return {"ready": False, "vision_ms": t_vis(), "lm_ms": 0.0, "num_pairs": len(vlm.cache)}
+        # D6 front-padding: the window is padded with the oldest pair until full — ready from tick 0.
         with cuda_timer() as t_lm:
-            hs = self._run_llm(vlm.cache.concat(), state, num_layers)
-        return self._finish(hs, t_vis(), t_lm())
+            hs = self._run_llm(vlm.cache.concat(pad_to_full=True), state, num_layers)
+        resp = self._finish(hs, t_vis(), t_lm())
+        resp["num_pairs"] = len(vlm.cache)
+        return resp
 
     @torch.inference_mode()
     def _full_step(self, frames, state, num_layers):
@@ -133,11 +135,49 @@ class StreamingQwenVLMPolicy:
         return resp
 
 
+class ActPolicyServerAdapter:
+    """Stage-2 action server: obs['mode'] in {reset, act}. Returns [horizon, 14] action chunks.
+
+    Mutually exclusive with the Stage-1 feature modes: pass --checkpoint to serve actions from a
+    fine-tuned VLA checkpoint; without it the server serves context features (cached/full).
+    """
+
+    def __init__(self, checkpoint_dir: str, device: str = "cuda") -> None:
+        from streaming_qwen_vlm.policy import ActPolicy  # noqa: E402 (heavy import, act mode only)
+
+        self.policy = ActPolicy(checkpoint_dir, device=device)
+        logger.info("VLA checkpoint loaded from %s; serving actions.", checkpoint_dir)
+
+    def infer(self, obs: dict) -> dict:
+        mode = obs.get("mode", "act")
+        if mode == "reset":
+            self.policy.reset()
+            return {"ok": True, "mode": "reset"}
+        if mode != "act":
+            raise ValueError(f"unknown mode {mode!r} (this server runs with --checkpoint: reset/act)")
+        frames = np.asarray(obs["frames"])
+        state = np.asarray(obs.get("state", np.zeros(self.policy.cfg.state_dim, dtype=np.float32)))
+        out = self.policy.act(frames, state)
+        t = out["timings"]
+        return {
+            "mode": "act",
+            "ready": True,
+            "actions": out["actions"],                    # float32 [horizon, 14] raw joint targets
+            "num_pairs": out["num_pairs"],
+            "vision_ms": t["vision_ms"],
+            "prefill_ms": t["prefill_ms"],
+            "denoise_ms": t["denoise_ms"],
+        }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--checkpoint", default=None,
+                    help="Path to a training step_XXXXXX checkpoint dir -> serve ACTIONS (mode 'act') "
+                         "instead of context features.")
     ap.add_argument("--num-pairs", type=int, default=15,
                     help="history window length in pairs (window_frames = 2*num_pairs). Default 15 = 30 frames; "
                          "use 5 for a 10-frame window. Client and server must agree (full mode sends 2*num_pairs frames).")
@@ -145,6 +185,23 @@ def main():
     ap.add_argument("--return-features", action="store_true",
                     help="Include the fp16 context-token tensor in the response (measures its net cost).")
     args = ap.parse_args()
+
+    if args.checkpoint:
+        policy = ActPolicyServerAdapter(args.checkpoint, device=args.device)
+        cfg = policy.policy.cfg
+        metadata = {
+            "model": cfg.model_id,
+            "serves": "actions",
+            "horizon": policy.policy.expert_cfg.horizon,
+            "action_dim": policy.policy.expert_cfg.action_dim,
+            "window_frames": cfg.window_frames,
+            "fixed_resolution": list(cfg.fixed_resolution),
+            "state_dim": cfg.state_dim,
+        }
+        server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=metadata)
+        logger.info("Serving ACTIONS on %s:%d (checkpoint=%s)", args.host, args.port, args.checkpoint)
+        server.serve_forever()
+        return
 
     cfg_kwargs = dict(device=args.device, num_pairs=args.num_pairs)
     if args.instruction:
@@ -154,6 +211,7 @@ def main():
     policy = StreamingQwenVLMPolicy(cfg, return_features=args.return_features)
     metadata = {
         "model": cfg.model_id,
+        "serves": "features",
         "window_frames": cfg.window_frames,
         "fixed_resolution": list(cfg.fixed_resolution),
         "total_video_tokens": cfg.total_video_tokens,

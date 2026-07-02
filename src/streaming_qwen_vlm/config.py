@@ -21,7 +21,7 @@ IMAGE_TOKEN_ID = 151655
 VISION_START_TOKEN_ID = 151652
 PIXEL_FACTOR = PATCH * MERGE  # 28: smart_resize rounds H,W to a multiple of this
 
-DEFAULT_INSTRUCTION = "You are a robot. Follow the visual scene and the instruction to act."
+DEFAULT_INSTRUCTION = "Watch the human, then put the block they indicated onto the plate."
 
 
 @dataclass
@@ -46,11 +46,20 @@ class VLMConfig:
     min_pixels: Optional[int] = None  # filled in __post_init__ to pin the grid
     max_pixels: Optional[int] = None
 
-    # Robot state encoding
+    # Robot state encoding.
+    # Stage 2 (VLA): state is discretized into the prompt as text (state_bins / state_prefix_text)
+    # and num_state_tokens defaults to 0 — the Stage-1 StateProjector token is retired from the
+    # main path (kept importable for ablations by setting num_state_tokens > 0).
     state_dim: int = 14
-    num_state_tokens: int = 1
+    num_state_tokens: int = 0
     state_hidden_dim: int = 256
     state_seed: int = 0
+    state_bins: int = 256
+    state_prefix_text: str = "\nState:"
+
+    # Stage-2 action head knobs (used by fast_tokens / policy; expert dims live in ExpertConfig)
+    max_fast_tokens: int = 128
+    num_denoise_steps: int = 10
 
     # Early-exit / compute knobs
     num_llm_layers_to_run: int = NUM_LLM_LAYERS
