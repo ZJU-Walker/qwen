@@ -143,7 +143,7 @@ wandb login
 # 1. compute q01/q99 normalization stats on the train split (writes checkpoints/norm_stats.json)
 python -m streaming_qwen_vlm.normalize --root /iris/projects/humanoid/trossen_data/0528_merge_block_mem --out checkpoints/norm_stats.json
 
-# 2. measure FAST tokens/chunk (confirm max <= 128, else raise max_fast_tokens in config)
+# 2. measure FAST tokens/chunk (already done: stride-1 max=147, p99=134 -> budget 192 in config)
 python -m streaming_qwen_vlm.fast_tokens --measure --stats checkpoints/norm_stats.json
 
 # 3. tests — CPU-ok (front-padding semantics; FAST round-trip needs the step-0 download)

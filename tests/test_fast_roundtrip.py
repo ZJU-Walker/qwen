@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from streaming_qwen_vlm.config import VLMConfig
 from streaming_qwen_vlm.fast_tokens import (
     IGNORE_INDEX,
     IM_END_ID,
@@ -19,10 +20,17 @@ from streaming_qwen_vlm.fast_tokens import (
     FastActionTokenizer,
     build_ar_row,
 )
-from streaming_qwen_vlm.normalize import compute_norm_stats, load_episode_arrays, normalize
+from streaming_qwen_vlm.normalize import (
+    compute_norm_stats,
+    load_episode_arrays,
+    load_stats,
+    normalize,
+)
 
 ROOT = "/iris/projects/humanoid/trossen_data/0528_merge_block_mem"
-HORIZON, DIM, MAX_FAST = 30, 14, 128
+STATS = "checkpoints/norm_stats.json"  # written by `python -m streaming_qwen_vlm.normalize`
+HORIZON, DIM = 30, 14
+MAX_FAST = VLMConfig().max_fast_tokens
 
 
 # ------------------------------------------------------------------ pure CPU, no downloads
@@ -53,7 +61,11 @@ def fast():
 def chunks():
     if not os.path.isdir(ROOT):
         pytest.skip(f"dataset not found at {ROOT}")
-    stats = compute_norm_stats(ROOT, [0, 1, 2])["action"]
+    # Prefer the real train-split stats (what training uses); 3-episode stats otherwise.
+    if os.path.exists(STATS):
+        stats = load_stats(STATS)["action"]
+    else:
+        stats = compute_norm_stats(ROOT, [0, 1, 2])["action"]
     out = []
     for ep in (0, 1, 2):
         actions = load_episode_arrays(ROOT, ep)["action"]

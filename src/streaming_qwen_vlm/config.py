@@ -57,8 +57,10 @@ class VLMConfig:
     state_bins: int = 256
     state_prefix_text: str = "\nState:"
 
-    # Stage-2 action head knobs (used by fast_tokens / policy; expert dims live in ExpertConfig)
-    max_fast_tokens: int = 128
+    # Stage-2 action head knobs (used by fast_tokens / policy; expert dims live in ExpertConfig).
+    # max_fast_tokens: measured over ALL 8868 train chunks (fast_tokens --measure --stride 1):
+    # max 147, p99 134 -> 192 leaves ~30% headroom incl. held-out episodes.
+    max_fast_tokens: int = 192
     num_denoise_steps: int = 10
 
     # Early-exit / compute knobs

@@ -22,7 +22,7 @@ class TrainConfig:
     # FAST
     fast_repo: str = "physical-intelligence/fast"
     fast_revision: Optional[str] = None     # pin after the first download
-    max_fast_tokens: int = 128
+    max_fast_tokens: int = 192              # measured train-split max 147 (+30% headroom)
 
     # Expert
     expert_width: int = 1024                # fallback 768 (~500M) if M3 overfits
