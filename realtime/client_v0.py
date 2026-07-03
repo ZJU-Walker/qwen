@@ -28,6 +28,7 @@ SERVER_IP = "iris-hgx-1"          # the GPU box running realtime/server.py --che
 SERVER_PORT = 8000
 LEROBOT_FORK_PATH = "/home/iris/lerobot"   # path to the lerobot Trossen fork on THIS robot machine
 EXECUTE = False                   # False = dry run (prints actions, no motion); True = actuate
+VIZ = True                        # show the 16-frame window (big current pair + 4x4 grid), threaded
 GRAVITY_COMP_TIME = 5.0           # seconds to hand-place both arms before actuation (execute only)
 MAX_ACTION_DELTA = 0.15           # max abs joint move per control step (rad) — rate limit
 # ================================================================================ #
@@ -223,8 +224,107 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
             cv2.destroyAllWindows()
 
 
+class WindowViz:
+    """Background-threaded mirror of the server's rolling window.
+
+    The CONTROL LOOP only calls push()/update_overlay() — lock-protected numpy writes, ~zero cost,
+    and it NEVER touches cv2. A daemon thread owns ALL OpenCV calls (GUI calls are not thread-safe)
+    and redraws the big-current-pair + 4x4-grid canvas at ~15 fps from the latest snapshot, polling
+    waitKey for 'q'. Rendering is decoupled from the control loop, so a slow imshow (e.g. over X11
+    forwarding) can never stall control. Check should_stop() for the 'q' keypress.
+    """
+
+    def __init__(self, window_frames: int, cols: int = 4, big: int = 384, cell: int = 160,
+                 fps: float = 15.0):
+        import threading
+
+        self.window_frames = window_frames
+        self.cols = cols
+        self.rows = (window_frames + cols - 1) // cols
+        self.big, self.cell = big, cell
+        self.win = "qwen window (sent to server)"
+        self._period = 1.0 / fps
+        self._lock = threading.Lock()
+        self._frames = deque(maxlen=window_frames)  # RGB uint8, oldest..newest
+        self._overlay = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    # --- called from the control loop (cheap, no cv2) ---
+    def push(self, frame_a, frame_b):
+        with self._lock:
+            self._frames.append(np.asarray(frame_a, dtype=np.uint8))
+            self._frames.append(np.asarray(frame_b, dtype=np.uint8))
+
+    def update_overlay(self, lines):
+        with self._lock:
+            self._overlay = list(lines)
+
+    def should_stop(self) -> bool:
+        return self._stop.is_set()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    # --- render thread: owns every cv2 call ---
+    def _run(self):
+        import time as _time
+
+        import cv2
+
+        while not self._stop.is_set():
+            t0 = _time.perf_counter()
+            with self._lock:
+                frames = list(self._frames)
+                overlay = list(self._overlay)
+            if frames:
+                cv2.imshow(self.win, self._build(cv2, frames, overlay))
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    self._stop.set()
+                    break
+            _time.sleep(max(0.0, self._period - (_time.perf_counter() - t0)))
+        cv2.destroyAllWindows()
+
+    def _build(self, cv2, frames, overlay):
+        while len(frames) < self.window_frames:  # front-pad like the server (repeat oldest)
+            frames.insert(0, frames[0])
+
+        def bgr(f, size):
+            return cv2.resize(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), (size, size),
+                              interpolation=cv2.INTER_NEAREST)
+
+        top = np.hstack([bgr(frames[-2], self.big), bgr(frames[-1], self.big)])
+        cv2.putText(top, "current pair (sent this tick)", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+        cells = []
+        for i, f in enumerate(frames):
+            c = bgr(f, self.cell)
+            if i >= self.window_frames - 2:  # newest pair
+                cv2.rectangle(c, (1, 1), (self.cell - 2, self.cell - 2), (0, 255, 0), 3)
+            cv2.putText(c, str(i), (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            cells.append(c)
+        rows = [np.hstack(cells[r * self.cols:(r + 1) * self.cols]) for r in range(self.rows)]
+        grid = np.vstack(rows)
+
+        W = max(top.shape[1], grid.shape[1])
+        def padw(img):
+            if img.shape[1] < W:
+                img = np.hstack([img, np.zeros((img.shape[0], W - img.shape[1], 3), np.uint8)])
+            return img
+        canvas = np.vstack([padw(top), padw(grid)])
+
+        for k, line in enumerate(overlay):
+            y = 58 + k * 26
+            cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1, cv2.LINE_AA)
+        return canvas
+
+
 def run_act(client, cam, execute: bool, meta: dict | None = None,
-            gravity_comp_time: float = 5.0, max_action_delta: float = 0.15):
+            gravity_comp_time: float = 5.0, max_action_delta: float = 0.15, viz: bool = False):
     """Stage-2 VLA loop against a --checkpoint server (mode 'act').
 
     The capture/execution cadence derives from the SERVER's metadata (fps, frames_per_pair,
@@ -250,14 +350,18 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
     exec_per_tick = frames_per_pair * frame_gap       # a new pair completes every tick
 
     period = 1.0 / control_hz
+    window_frames = int(meta.get("window_frames", 16))
+    viewer = WindowViz(window_frames) if viz else None
     # Warmup FIRST (arms back-drivable), then reset the server cache and start streaming.
     last_action = cam.gravity_comp_warmup(gravity_comp_time) if execute else None
     client.infer({"mode": "reset"})
     print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz (fps={fps}) "
-          f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'}). Ctrl-C to stop.")
+          f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'})"
+          f"{' +viz' if viz else ''}. Ctrl-C{' or q in window' if viz else ''} to stop.")
 
     result = {}  # cross-thread: {"resp": dict, "t_sent": float}
     lock = threading.Lock()
+    last_meta = {"rtt": 0.0, "vis": 0.0, "prefill": 0.0, "denoise": 0.0, "pairs": "?"}
 
     def request(frames, state, t_sent):
         t0 = time.perf_counter()
@@ -275,6 +379,8 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
             if i % exec_per_tick == 0:                        # tick: capture second frame + state, fire request
                 frame_b, state = cam.capture()
                 fa = frame_a if frame_a is not None else frame_b
+                if viewer is not None:
+                    viewer.push(fa, frame_b)                  # mirror the sent pair into the window
                 threading.Thread(target=request, daemon=True,
                                  args=(np.stack([fa, frame_b]), state, time.perf_counter())).start()
                 tick += 1
@@ -284,7 +390,10 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
                     late = int(round((time.perf_counter() - result.pop("t_sent")) * control_hz))
                     chunk, idx = np.asarray(resp["actions"]), min(late, 9)
                     n_pairs = int(meta.get("window_frames", 30)) // frames_per_pair
-                    print(f"tick {tick:4d}  rtt={result.pop('rtt'):6.1f}ms  "
+                    last_meta = {"rtt": result.pop("rtt"), "vis": resp["vision_ms"],
+                                 "prefill": resp["prefill_ms"], "denoise": resp["denoise_ms"],
+                                 "pairs": resp.get("num_pairs", "?")}
+                    print(f"tick {tick:4d}  rtt={last_meta['rtt']:6.1f}ms  "
                           f"(vis={resp['vision_ms']:.0f} prefill={resp['prefill_ms']:.0f} "
                           f"denoise={resp['denoise_ms']:.0f})  start_idx={idx}  "
                           f"pairs={resp.get('num_pairs', '?')}/{n_pairs}")
@@ -300,10 +409,21 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
                     cam.act(action)
                 elif i % exec_per_tick == 0:
                     print(f"    action[0:4]={np.round(action[:4], 3).tolist()} ...")
+            if viewer is not None:                            # cheap: overlay text + q check
+                viewer.update_overlay([
+                    f"tick {tick}  {control_hz:.0f}Hz  {'EXEC' if execute else 'DRY'}",
+                    f"rtt {last_meta['rtt']:.0f}ms  vis {last_meta['vis']:.0f}  "
+                    f"prefill {last_meta['prefill']:.0f}  denoise {last_meta['denoise']:.0f}  "
+                    f"pairs {last_meta['pairs']}"])
+                if viewer.should_stop():
+                    break
             i += 1
             time.sleep(max(0.0, period - (time.perf_counter() - t_iter)))
     except KeyboardInterrupt:
         print("\nstopped.")
+    finally:
+        if viewer is not None:
+            viewer.close()
 
 
 def main():
@@ -328,6 +448,10 @@ def main():
                     help="act+execute: seconds of gravity-comp warmup to hand-place the arms")
     ap.add_argument("--max-action-delta", type=float, default=MAX_ACTION_DELTA,
                     help="act+execute: max abs joint move per control step (rad)")
+    ap.add_argument("--viz", dest="viz", action="store_true", default=VIZ,
+                    help="act: show the 16-frame window (big current pair + 4x4 grid)")
+    ap.add_argument("--no-viz-act", dest="viz", action="store_false",
+                    help="act: disable the window (headless)")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
@@ -352,7 +476,7 @@ def main():
         try:
             run_act(client, cam, execute=args.execute, meta=meta,
                     gravity_comp_time=args.gravity_comp_time,
-                    max_action_delta=args.max_action_delta)
+                    max_action_delta=args.max_action_delta, viz=args.viz)
         finally:
             cam.close()
         return
