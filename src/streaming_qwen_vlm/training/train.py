@@ -121,14 +121,27 @@ def main() -> None:
     vla = QwenVLA(backbone, processor, vlm_cfg, expert_cfg, fast.vocab_size).to(device)
     vla.train()
     if tc.compile:
-        # Regional compile: decoder layers only. Shapes are static there (constant S_total, fixed
-        # micro-batch); the ViT is excluded (its batch varies with the unique-pair count) and the
-        # KV export calls layer submodules directly, outside the compiled forward. Composes with
-        # per-layer checkpointing (the checkpoint wrapper calls the compiled forward).
+        # Regional compile: ONLY the decoder layers that gradient checkpointing never recomputes
+        # (with --ckpt-stride 2 that's the odd layers). Compiled functions inside a checkpointed
+        # region fail the recompute-determinism check (AOTAutograd saves a different tensor set on
+        # replay -> CheckpointError), so checkpointed layers stay eager. Shapes are static here
+        # (constant S_total, fixed micro-batch); ViT excluded (variable unique-pair batch); the KV
+        # export calls layer submodules directly, outside the compiled forward.
+        import torch._dynamo
+
+        torch._dynamo.config.cache_size_limit = 64  # room for per-layer specializations
         layers = vla.backbone.model.language_model.layers
+        compiled = 0
         for layer in layers:
-            layer.forward = torch.compile(layer.forward, dynamic=False)
-        print(f"[train] compiled {len(layers)} decoder layers (first step takes minutes to warm up)")
+            if not getattr(layer, "gradient_checkpointing", False):
+                layer.forward = torch.compile(layer.forward, dynamic=False)
+                compiled += 1
+        if compiled == 0:
+            print("[train] --compile has no effect with --ckpt-stride 1: every layer is "
+                  "checkpointed (recomputed), and compiled layers cannot be checkpointed")
+        else:
+            print(f"[train] compiled {compiled}/{len(layers)} non-checkpointed decoder layers "
+                  f"(first step takes minutes to warm up)")
     n_bb = sum(p.numel() for p in vla.backbone.parameters())
     n_new = sum(p.numel() for p in vla.expert.parameters()) + vla.fast_embed.weight.numel() \
         + vla.fast_head.weight.numel()
