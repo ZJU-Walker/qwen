@@ -41,12 +41,18 @@ class TrainConfig:
     ema_decay: float = 0.999                # expert only (full-model EMA costs ~18 GB)
     seed: int = 0
 
+    # Speed knobs (opt-in; defaults = original behavior)
+    ckpt_stride: int = 1        # recompute every N-th LLM layer only; 2 = ~+10% speed, +~29 GB
+    compile: bool = False       # regional torch.compile of the 36 decoder layers (~1-3 min warmup)
+
     # Cadence / output
     log_every: int = 20
     eval_every: int = 1_000
     eval_batches: int = 8
-    save_every: int = 2_000
-    keep_last: int = 3
+    save_every: int = 500       # deployable step_XXXXXX snapshot (11 GB) cadence
+    keep_every: int = 2_000     # snapshots at these multiples are kept forever (milestones)
+    keep_last: int = 3          # newest non-milestone snapshots kept
+    resume_every: int = 2_000   # fp32 resume bundle (55 GB) cadence — heavier, so rarer
     out_dir: str = "checkpoints/run1"
     tmp_dir: Optional[str] = None             # local scratch for multiprocessing temp files
     wandb_project: str = "qwen-vla"

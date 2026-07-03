@@ -175,13 +175,30 @@ python examples/replay_policy.py --checkpoint checkpoints/overfit/step_002000 --
 Gate passes when FAST token accuracy → ~1.0, val open-loop MSE ≈ 0, and the replay curves track
 the demo.
 
-### Step 3 — M3 full training (H200, ~30k steps, 1–3 days)
+### Step 3 — M3 full training (H200, ~30k steps)
 
 ```bash
-python -m streaming_qwen_vlm.training.train --out-dir checkpoints/run1     # wandb project qwen-vla
+# recommended: all speed knobs (dedup is automatic; stride/compile are opt-in flags)
+python -m streaming_qwen_vlm.training.train --out-dir checkpoints/run2 --ckpt-stride 2 --compile
 # resume after interruption:  add --resume
 # overfitting fallback:       add --expert-width 768
+# on a shared node: prefix CUDA_VISIBLE_DEVICES=<gpu>, consider --num-workers 8
 ```
+
+Speed knobs: `--ckpt-stride 2` recomputes only alternate LLM layers (~+10%, +~29 GB → ~125 GB
+peak); `--compile` regionally torch.compiles the 36 decoder layers (~+15-30%, first step takes
+minutes to warm up; if it misbehaves just relaunch without it). Smoke a flag combo first:
+
+```bash
+python -m streaming_qwen_vlm.training.train --overfit-episode 0 --steps 60 --warmup-steps 10 \
+    --eval-every 30 --save-every 30 --keep-every 60 --out-dir checkpoints/smoke2 --ckpt-stride 2 --compile
+```
+
+Checkpoint cadence (defaults): deployable `step_XXXXXX` snapshots (11 GB) every 500 steps;
+snapshots at multiples of `--keep-every` (2000) are kept forever, others pruned to the newest
+`--keep-last` (3); the fp32 resume bundle (`latest/`, 55 GB) refreshes every `--resume-every`
+(2000). Disk math at 30k steps ≈ 165 GB milestones + 33 GB recents + 55 GB resume — watch
+`df -h /iris/projects/humanoid` and delete stale run/smoke dirs.
 
 ### Step 4 — M4 deployment
 

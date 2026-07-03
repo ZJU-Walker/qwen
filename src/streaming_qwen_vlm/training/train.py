@@ -108,9 +108,27 @@ def main() -> None:
     backbone, processor = load_backbone(vlm_cfg)
     backbone = backbone.float()
     backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if tc.ckpt_stride > 1:
+        # Recompute only every ckpt_stride-th LLM decoder layer; the rest keep their activations
+        # (stride 2: ~+10% speed, ~+29 GB). ViT blocks stay fully checkpointed.
+        n_ckpt = 0
+        for i, layer in enumerate(backbone.model.language_model.layers):
+            layer.gradient_checkpointing = i % tc.ckpt_stride == 0
+            n_ckpt += int(layer.gradient_checkpointing)
+        print(f"[train] ckpt_stride={tc.ckpt_stride}: checkpointing {n_ckpt}/"
+              f"{len(backbone.model.language_model.layers)} LLM layers")
     expert_cfg = ExpertConfig(width=tc.expert_width, mlp_dim=tc.expert_mlp_dim, horizon=tc.horizon)
     vla = QwenVLA(backbone, processor, vlm_cfg, expert_cfg, fast.vocab_size).to(device)
     vla.train()
+    if tc.compile:
+        # Regional compile: decoder layers only. Shapes are static there (constant S_total, fixed
+        # micro-batch); the ViT is excluded (its batch varies with the unique-pair count) and the
+        # KV export calls layer submodules directly, outside the compiled forward. Composes with
+        # per-layer checkpointing (the checkpoint wrapper calls the compiled forward).
+        layers = vla.backbone.model.language_model.layers
+        for layer in layers:
+            layer.forward = torch.compile(layer.forward, dynamic=False)
+        print(f"[train] compiled {len(layers)} decoder layers (first step takes minutes to warm up)")
     n_bb = sum(p.numel() for p in vla.backbone.parameters())
     n_new = sum(p.numel() for p in vla.expert.parameters()) + vla.fast_embed.weight.numel() \
         + vla.fast_head.weight.numel()
@@ -136,7 +154,8 @@ def main() -> None:
                             pin_memory=True)
 
     optimizer = torch.optim.AdamW(vla.param_groups(tc.lr_backbone, tc.lr_new),
-                                  betas=(0.9, 0.95), eps=1e-8, weight_decay=tc.weight_decay)
+                                  betas=(0.9, 0.95), eps=1e-8, weight_decay=tc.weight_decay,
+                                  fused=True)  # single-kernel step over 4.6B fp32 params (~2-4%)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=functools.partial(_lr_lambda, warmup=tc.warmup_steps, total=tc.steps,
@@ -224,10 +243,14 @@ def main() -> None:
 
         if (step + 1) % tc.save_every == 0 or step + 1 == tc.steps:
             path = checkpoints.save_step_checkpoint(tc.out_dir, step + 1, vla, processor,
-                                                    ema_state, tc, tc.norm_stats, tc.keep_last)
+                                                    ema_state, tc, tc.norm_stats,
+                                                    keep_last=tc.keep_last,
+                                                    keep_every=tc.keep_every)
+            print(f"[train] saved {path}")
+        # The 55 GB fp32 resume bundle is crash insurance only — heavier, so on its own cadence.
+        if (step + 1) % tc.resume_every == 0 or step + 1 == tc.steps:
             checkpoints.save_resume_state(tc.out_dir, step + 1, vla, optimizer, scheduler,
                                           ema_state)
-            print(f"[train] saved {path}")
 
     logger.finish() if hasattr(logger, "finish") else None
     print("[train] done")

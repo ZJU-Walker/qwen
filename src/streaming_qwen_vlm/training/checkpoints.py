@@ -35,7 +35,8 @@ def _heads_state_dict(vla, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
 
 
 def save_step_checkpoint(out_dir: str, step: int, vla, processor, ema_state: Dict[str, torch.Tensor],
-                         train_cfg, norm_stats_path: str, keep_last: int = 3) -> str:
+                         train_cfg, norm_stats_path: str, keep_last: int = 3,
+                         keep_every: int = 0) -> str:
     path = os.path.join(out_dir, f"step_{step:06d}")
     bdir = os.path.join(path, "backbone")
     os.makedirs(bdir, exist_ok=True)
@@ -64,13 +65,19 @@ def save_step_checkpoint(out_dir: str, step: int, vla, processor, ema_state: Dic
     if os.path.exists(norm_stats_path):
         shutil.copy(norm_stats_path, os.path.join(path, "norm_stats.json"))
 
-    _prune(out_dir, keep_last)
+    _prune(out_dir, keep_last, keep_every)
     return path
 
 
-def _prune(out_dir: str, keep_last: int) -> None:
+def _prune(out_dir: str, keep_last: int, keep_every: int = 0) -> None:
+    """Delete step_XXXXXX dirs that are neither keep_every milestones nor the newest keep_last."""
     steps = sorted(d for d in os.listdir(out_dir) if d.startswith("step_"))
-    for d in steps[:-keep_last] if keep_last > 0 else []:
+    recent = set(steps[-keep_last:]) if keep_last > 0 else set()
+    for d in steps:
+        if d in recent:
+            continue
+        if keep_every > 0 and int(d[len("step_"):]) % keep_every == 0:
+            continue  # permanent milestone
         shutil.rmtree(os.path.join(out_dir, d), ignore_errors=True)
 
 
