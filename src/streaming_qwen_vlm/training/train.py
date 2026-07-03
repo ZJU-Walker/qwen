@@ -127,9 +127,11 @@ def main() -> None:
         # replay -> CheckpointError), so checkpointed layers stay eager. Shapes are static here
         # (constant S_total, fixed micro-batch); ViT excluded (variable unique-pair batch); the KV
         # export calls layer submodules directly, outside the compiled forward.
-        import torch._dynamo
+        # NOTE: `import torch._dynamo` here would shadow the module-level `torch` as a local
+        # for ALL of main() (UnboundLocalError at torch.manual_seed); bind only `_dynamo`.
+        from torch import _dynamo
 
-        torch._dynamo.config.cache_size_limit = 64  # room for per-layer specializations
+        _dynamo.config.cache_size_limit = 64  # room for per-layer specializations
         layers = vla.backbone.model.language_model.layers
         compiled = 0
         for layer in layers:
