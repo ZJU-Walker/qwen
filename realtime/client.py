@@ -28,6 +28,8 @@ SERVER_IP = "iris-hgx-1"          # the GPU box running realtime/server.py --che
 SERVER_PORT = 8000
 LEROBOT_FORK_PATH = "/home/iris/lerobot"   # path to the lerobot Trossen fork on THIS robot machine
 EXECUTE = False                   # False = dry run (prints actions, no motion); True = actuate
+CONTROL_FREQ = 30.0               # send/execute rate in Hz (dt = 1/CONTROL_FREQ)
+ACTIONS_PER_CHUNK = 20            # how many of the [horizon=30, 14] chunk to run before re-requesting
 GRAVITY_COMP_TIME = 5.0           # seconds to hand-place both arms before actuation (execute only)
 MAX_ACTION_DELTA = 0.15           # max abs joint move per control step (rad) — rate limit
 # ================================================================================ #
@@ -224,84 +226,96 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
 
 
 def run_act(client, cam, execute: bool, meta: dict | None = None,
-            gravity_comp_time: float = 5.0, max_action_delta: float = 0.15):
+            gravity_comp_time: float = 5.0, max_action_delta: float = 0.15,
+            control_freq: float = 30.0, actions_per_chunk: int = 20):
     """Stage-2 VLA loop against a --checkpoint server (mode 'act').
 
-    The capture/execution cadence derives from the SERVER's metadata (fps, frames_per_pair,
-    control_hz), so one client serves any checkpoint config: run1-style (3 fps -> tick every 20
-    control steps) or run3-style (2 fps -> tick every 30). Each tick sends the 2 newest frames
-    (captured 1/fps s apart, matching the training pair grid) + current state in a background
-    thread; the previous chunk keeps executing meanwhile, and the ``min(idx, len-1)`` clamp holds
-    the last action through the fetch gap.
+    Cadence is EXPLICIT (top-of-file constants), decoupled from the training grid:
+    - control_freq: actions are sent at this rate (Hz); dt = 1/control_freq.
+    - actions_per_chunk: how many of the server's [horizon,14] chunk to execute before requesting
+      the next one. The request for chunk k+1 is fired when chunk k STARTS executing, so inference
+      (~0.4 s) overlaps execution (actions_per_chunk / control_freq s). If the next chunk is late,
+      the arm HOLDS the last action (chunk[min(idx,len-1)]) until it lands.
 
-    Safety (ported from openpi eval_real_RTC_working_warmup.py): with --execute, a gravity-comp
-    warmup lets the operator hand-place BOTH follower arms (incl. the static left arm) at the start
-    pose before actuation; then every commanded action is rate-limited so absolute-position targets
-    can't jump more than ``max_action_delta`` rad/control-step. Without --execute, actions are
-    printed, not sent (and the warmup is skipped).
+    The 2 frames per request are captured ~1/fps s apart to match the training pair grid; state is
+    the current robot state at request time.
+
+    Safety (from openpi eval_real_RTC_working_warmup.py): with --execute, a gravity-comp warmup lets
+    the operator hand-place BOTH follower arms (incl. the static left arm) first; every commanded
+    action is then rate-limited to +/-max_action_delta rad/step. Without --execute: prints only.
     """
     import threading
 
     meta = meta or {}
-    control_hz = float(meta.get("control_hz", 30))
     fps = int(meta.get("fps", 3))
-    frames_per_pair = int(meta.get("frames_per_pair", 2))
-    frame_gap = int(round(control_hz / fps))          # control steps between the pair's 2 frames
-    exec_per_tick = frames_per_pair * frame_gap       # a new pair completes every tick
+    horizon = int(meta.get("horizon", 30))
+    actions_per_chunk = max(1, min(actions_per_chunk, horizon))
+    frame_gap_s = 1.0 / fps                 # real-time gap between the pair's two frames
+    dt = 1.0 / control_freq
 
-    period = 1.0 / control_hz
-    # Warmup FIRST (arms back-drivable), then reset the server cache and start streaming.
     last_action = cam.gravity_comp_warmup(gravity_comp_time) if execute else None
     client.infer({"mode": "reset"})
-    print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz (fps={fps}) "
-          f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'}). Ctrl-C to stop.")
+    print(f"ACT loop: horizon={horizon}, executing {actions_per_chunk}/chunk @ {control_freq:.0f} Hz "
+          f"({'EXECUTING' if execute else 'DRY RUN — prints only'}). Ctrl-C to stop.")
 
-    result = {}  # cross-thread: {"resp": dict, "t_sent": float}
+    result = {}  # cross-thread handoff from the request thread
     lock = threading.Lock()
 
-    def request(frames, state, t_sent):
+    def request(frames, state):
         t0 = time.perf_counter()
         resp = client.infer({"mode": "act", "frames": frames, "state": state})
         with lock:
-            result["resp"], result["t_sent"], result["rtt"] = resp, t_sent, (time.perf_counter() - t0) * 1e3
+            result["resp"], result["rtt"] = resp, (time.perf_counter() - t0) * 1e3
 
-    chunk, idx, frame_a, tick = None, 0, None, 0
+    def capture_pair():
+        """Two frames ~1/fps s apart + the newest state (matches the training pair)."""
+        frame_a, _ = cam.capture()
+        time.sleep(frame_gap_s)
+        frame_b, state = cam.capture()
+        return np.stack([frame_a, frame_b]), state
+
+    chunk, pending, tick = None, False, 0
     try:
-        i = 0
+        # Prime the first chunk synchronously so we have actions to execute.
+        frames, state = capture_pair()
+        request(frames, state)
         while True:
-            t_iter = time.perf_counter()
-            if i % exec_per_tick == exec_per_tick - frame_gap:  # capture the pair's first frame
-                frame_a, _ = cam.capture()
-            if i % exec_per_tick == 0:                        # tick: capture second frame + state, fire request
-                frame_b, state = cam.capture()
-                fa = frame_a if frame_a is not None else frame_b
-                threading.Thread(target=request, daemon=True,
-                                 args=(np.stack([fa, frame_b]), state, time.perf_counter())).start()
-                tick += 1
             with lock:
                 resp = result.pop("resp", None)
-                if resp is not None:
-                    late = int(round((time.perf_counter() - result.pop("t_sent")) * control_hz))
-                    chunk, idx = np.asarray(resp["actions"]), min(late, 9)
-                    n_pairs = int(meta.get("window_frames", 30)) // frames_per_pair
-                    print(f"tick {tick:4d}  rtt={result.pop('rtt'):6.1f}ms  "
-                          f"(vis={resp['vision_ms']:.0f} prefill={resp['prefill_ms']:.0f} "
-                          f"denoise={resp['denoise_ms']:.0f})  start_idx={idx}  "
-                          f"pairs={resp.get('num_pairs', '?')}/{n_pairs}")
-            if chunk is not None:
-                action = chunk[min(idx, len(chunk) - 1)]
-                idx += 1
+                rtt = result.pop("rtt", None)
+            if resp is not None:
+                chunk, pending, tick = np.asarray(resp["actions"]), False, tick + 1
+                print(f"tick {tick:4d}  rtt={rtt:6.1f}ms  (vis={resp['vision_ms']:.0f} "
+                      f"prefill={resp['prefill_ms']:.0f} denoise={resp['denoise_ms']:.0f})  "
+                      f"pairs={resp.get('num_pairs', '?')}")
+
+            # Execute up to actions_per_chunk from the current chunk; fire the next request at idx 0.
+            for idx in range(actions_per_chunk):
+                t_step = time.perf_counter()
+                if idx == 0 and not pending:
+                    frames, state = capture_pair()
+                    pending = True
+                    threading.Thread(target=request, args=(frames, state), daemon=True).start()
+
+                action = chunk[min(idx, len(chunk) - 1)]  # hold last if chunk shorter than N
                 if execute:
-                    # Rate-limit: clip the per-control-step move so a bad absolute target can't jump.
                     if last_action is not None:
                         delta = np.clip(action - last_action, -max_action_delta, max_action_delta)
                         action = (last_action + delta).astype(np.float32)
                     last_action = action
                     cam.act(action)
-                elif i % exec_per_tick == 0:
+                elif idx == 0:
                     print(f"    action[0:4]={np.round(action[:4], 3).tolist()} ...")
-            i += 1
-            time.sleep(max(0.0, period - (time.perf_counter() - t_iter)))
+                time.sleep(max(0.0, dt - (time.perf_counter() - t_step)))
+
+            # If the next chunk hasn't arrived, hold the last action until it does.
+            while pending:
+                with lock:
+                    if "resp" in result:
+                        break          # arrived; the top-of-loop handler will consume it
+                if execute and last_action is not None:
+                    cam.act(last_action)
+                time.sleep(dt)
     except KeyboardInterrupt:
         print("\nstopped.")
 
@@ -328,6 +342,10 @@ def main():
                     help="act+execute: seconds of gravity-comp warmup to hand-place the arms")
     ap.add_argument("--max-action-delta", type=float, default=MAX_ACTION_DELTA,
                     help="act+execute: max abs joint move per control step (rad)")
+    ap.add_argument("--control-freq", type=float, default=CONTROL_FREQ,
+                    help="act: send/execute rate in Hz")
+    ap.add_argument("--actions-per-chunk", type=int, default=ACTIONS_PER_CHUNK,
+                    help="act: how many of the chunk to execute before requesting the next")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
@@ -352,7 +370,9 @@ def main():
         try:
             run_act(client, cam, execute=args.execute, meta=meta,
                     gravity_comp_time=args.gravity_comp_time,
-                    max_action_delta=args.max_action_delta)
+                    max_action_delta=args.max_action_delta,
+                    control_freq=args.control_freq,
+                    actions_per_chunk=args.actions_per_chunk)
         finally:
             cam.close()
         return
