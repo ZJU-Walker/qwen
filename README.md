@@ -178,12 +178,19 @@ the demo.
 ### Step 3 — M3 full training (H200, ~30k steps)
 
 ```bash
-# recommended: all speed knobs (dedup is automatic; stride/compile are opt-in flags)
-python -m streaming_qwen_vlm.training.train --out-dir checkpoints/run2 --ckpt-stride 2 --compile
+# run3 config: 224x224, 16-frame window @ 2 fps (512 video tokens, ~3x fewer FLOPs than 336/30f/3fps)
+python -m streaming_qwen_vlm.training.train --out-dir checkpoints/run3 --steps 15000 \
+    --resolution 224 --fps 2 --num-pairs 8 --ckpt-stride 2 --compile
 # resume after interruption:  add --resume
 # overfitting fallback:       add --expert-width 768
 # on a shared node: prefix CUDA_VISIBLE_DEVICES=<gpu>, consider --num-workers 8
 ```
+
+The vision config (`--resolution/--fps/--num-pairs`) is saved in each checkpoint's meta.json;
+`ActPolicy`, `replay_policy.py`, and the realtime server/client all rebuild the grid from the
+checkpoint (the client reads the server's metadata for capture resolution and tick cadence), so
+checkpoints from DIFFERENT vision configs (e.g. run1 at 336/3fps and run3 at 224/2fps) are all
+servable with the same code.
 
 Speed knobs: `--ckpt-stride 2` recomputes only alternate LLM layers (~+10%, +~29 GB → ~125 GB
 peak); `--compile` regionally torch.compiles the 36 decoder layers (~+15-30%, first step takes

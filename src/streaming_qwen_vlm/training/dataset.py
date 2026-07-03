@@ -1,11 +1,14 @@
 """Tick-aligned, front-padded training dataset over the Trossen LeRobot episodes.
 
-Sampling (claude_plan §3 + D5/D6): any control step t >= 10 is a sample (~10k samples across 61
-episodes, a ~20x multiplier over tick-only sampling). The visual window is built on the deployment
-tick grid — dataset 30 fps, VLM 3 fps => frame stride 10, pair k = frames (20k, 20k+10) — using the
-pairs fully observed by t, front-padded by repeating the OLDEST pair exactly like
+Sampling (claude_plan §3 + D5/D6): any control step t with at least one complete pair is a sample
+(a ~tick_stride multiplier over tick-only sampling). The visual window is built on the deployment
+tick grid, DERIVED FROM VLMConfig so different runs coexist — 30 Hz data at cfg.fps gives
+frame_stride = 30/fps control steps between sampled frames; pair k = frames
+(tick_stride*k, tick_stride*k + frame_stride) with tick_stride = frames_per_pair*frame_stride
+(336/3fps run1 grid: 10/20; 224/2fps run3 grid: 15/30). Windows use the pairs fully observed by
+t, front-padded by repeating the OLDEST pair exactly like
 ``PairVisionCache.concat(pad_to_full=True)`` (bit-identical windows, gated by
-tests/test_dataloader_streaming_parity.py). Visual staleness <= 19 control steps matches
+tests/test_dataloader_streaming_parity.py). Visual staleness < tick_stride control steps matches
 deployment's within-chunk staleness by construction.
 
 Targets: actions a[t : t+horizon] at native 30 Hz, padded past the episode end by repeating the
@@ -40,16 +43,30 @@ from ..normalize import NormStats, discretize, load_episode_arrays, normalize
 from ..preprocess import pair_to_pixel_values, prepare_frames
 from ..state_text import bins_to_ids
 
-FRAME_STRIDE = 10   # 30 fps -> 3 fps
-TICK_STRIDE = 20    # control steps per completed pair (= per deployment tick)
-MIN_T = 10          # first control step with a complete pair (frames 0, 10)
+DATASET_CTRL_HZ = 30  # Trossen data control rate (property of the dataset, not of a run config)
 
 
-def pair_frame_indices(t: int, num_pairs: int) -> List[int]:
-    """The <= num_pairs pair indices (front-padded with 0) whose frames are all <= t."""
-    if t < MIN_T:
-        raise ValueError(f"t={t} < {MIN_T}: no complete pair exists yet")
-    k_max = (t - MIN_T) // TICK_STRIDE
+def frame_stride(fps: int) -> int:
+    """Control steps between sampled frames (also the earliest t with a complete pair)."""
+    if fps <= 0 or DATASET_CTRL_HZ % fps != 0:
+        raise ValueError(f"cfg.fps={fps} must divide the {DATASET_CTRL_HZ} Hz control rate")
+    return DATASET_CTRL_HZ // fps
+
+
+def tick_stride(cfg) -> int:
+    """Control steps per completed pair (= per deployment tick)."""
+    return cfg.frames_per_pair * frame_stride(cfg.fps)
+
+
+def pair_frame_indices(t: int, num_pairs: int, t_stride: int, f_stride: int) -> List[int]:
+    """The <= num_pairs pair indices (front-padded with 0) whose frames are all <= t.
+
+    Pair k = frames (t_stride*k, t_stride*k + f_stride); the first complete pair needs
+    t >= f_stride.
+    """
+    if t < f_stride:
+        raise ValueError(f"t={t} < {f_stride}: no complete pair exists yet")
+    k_max = (t - f_stride) // t_stride
     return [max(0, k) for k in range(k_max - num_pairs + 1, k_max + 1)]
 
 
@@ -71,6 +88,8 @@ class TrossenActDataset(Dataset):
     ) -> None:
         self.root = root
         self.cfg = cfg
+        self.f_stride = frame_stride(cfg.fps)
+        self.t_stride = tick_stride(cfg)
         self.processor = processor
         self.state_lut = state_lut
         self.action_stats = action_stats
@@ -91,8 +110,8 @@ class TrossenActDataset(Dataset):
             n_jpgs = len([f for f in os.listdir(self._frames_dir(ep)) if f.endswith(".jpg")])
             if n_jpgs != T:
                 raise RuntimeError(f"episode {ep}: {n_jpgs} JPGs != {T} parquet rows")
-            step = TICK_STRIDE if tick_aligned else 1
-            self.samples.extend((ep, t) for t in range(MIN_T, T, step))
+            step = self.t_stride if tick_aligned else 1
+            self.samples.extend((ep, t) for t in range(self.f_stride, T, step))
 
     # --- helpers ---
     def _frames_dir(self, ep: int) -> str:
@@ -118,12 +137,12 @@ class TrossenActDataset(Dataset):
 
         # 1. Visual window: UNIQUE pairs only (chronological); slot_map expands them into the
         #    15 window slots downstream (front-pad = repeated slot 0, never a repeated encode).
-        ks = pair_frame_indices(t, cfg.num_pairs)
+        ks = pair_frame_indices(t, cfg.num_pairs, self.t_stride, self.f_stride)
         unique_ks = list(dict.fromkeys(ks))  # order-preserving == chronological
         pv_by_k: Dict[int, torch.Tensor] = {}
         for k in unique_ks:
-            fa = self._load_frame(ep, TICK_STRIDE * k)
-            fb = self._load_frame(ep, TICK_STRIDE * k + FRAME_STRIDE)
+            fa = self._load_frame(ep, self.t_stride * k)
+            fb = self._load_frame(ep, self.t_stride * k + self.f_stride)
             prepared = prepare_frames([fa, fb], cfg)
             pv_by_k[k] = pair_to_pixel_values(self.processor, prepared, cfg)["pixel_values_videos"]
         pixel_values = torch.cat([pv_by_k[k] for k in unique_ks], dim=0)  # [n_unique*576, 1176] f32

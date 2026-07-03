@@ -17,6 +17,10 @@ class TrainConfig:
     holdout_every: int = 10
     horizon: int = 30
     instruction: Optional[str] = None       # None -> VLMConfig default
+    # Vision config (per-run; saved in checkpoint meta so serving adapts automatically):
+    resolution: int = 336                   # square input, multiple of 28 (224 -> 64 tok/pair)
+    fps: int = 3                            # sampled frame rate; must divide the 30 Hz data rate
+    num_pairs: int = 15                     # window length in 2-frame pairs
     num_workers: int = 12
 
     # FAST

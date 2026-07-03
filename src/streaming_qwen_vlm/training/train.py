@@ -82,7 +82,11 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda")
 
-    vlm_cfg = VLMConfig() if tc.instruction is None else VLMConfig(instruction=tc.instruction)
+    vlm_kwargs = dict(fixed_resolution=(tc.resolution, tc.resolution), fps=tc.fps,
+                      num_pairs=tc.num_pairs)
+    if tc.instruction is not None:
+        vlm_kwargs["instruction"] = tc.instruction
+    vlm_cfg = VLMConfig(**vlm_kwargs)  # grids/token counts/template all derive from this
     assert vlm_cfg.num_state_tokens == 0, "Stage 2 uses state-as-text; num_state_tokens must be 0"
 
     # Norm stats (train split only).

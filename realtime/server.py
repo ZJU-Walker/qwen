@@ -189,6 +189,8 @@ def main():
     if args.checkpoint:
         policy = ActPolicyServerAdapter(args.checkpoint, device=args.device)
         cfg = policy.policy.cfg
+        from streaming_qwen_vlm.training.dataset import DATASET_CTRL_HZ  # noqa: E402
+
         metadata = {
             "model": cfg.model_id,
             "serves": "actions",
@@ -197,6 +199,10 @@ def main():
             "window_frames": cfg.window_frames,
             "fixed_resolution": list(cfg.fixed_resolution),
             "state_dim": cfg.state_dim,
+            # temporal grid: the client derives its capture/execution cadence from these
+            "fps": cfg.fps,
+            "frames_per_pair": cfg.frames_per_pair,
+            "control_hz": DATASET_CTRL_HZ,
         }
         server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=metadata)
         logger.info("Serving ACTIONS on %s:%d (checkpoint=%s)", args.host, args.port, args.checkpoint)

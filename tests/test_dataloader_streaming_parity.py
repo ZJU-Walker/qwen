@@ -25,11 +25,10 @@ from streaming_qwen_vlm.normalize import compute_norm_stats, discretize, load_ep
 from streaming_qwen_vlm.preprocess import pair_to_pixel_values, prepare_frames
 from streaming_qwen_vlm.state_text import bins_to_ids, build_state_lut
 from streaming_qwen_vlm.training.dataset import (
-    FRAME_STRIDE,
-    MIN_T,
-    TICK_STRIDE,
     TrossenActDataset,
+    frame_stride,
     pair_frame_indices,
+    tick_stride,
 )
 from streaming_qwen_vlm.vision_cache import PairVisionCache
 from .test_vision_cache_equivalence import _visual_in_fp32
@@ -76,12 +75,13 @@ def test_pixel_and_lowdim_parity(dataset, cfg, processor, t):
 
     # --- pixels: dataset stores UNIQUE pairs + slot_map; the slot expansion must be bit-exact
     # vs an independent rebuild over the streaming pair grid (duplicates included) ---
-    ks = pair_frame_indices(t, cfg.num_pairs)
+    ts_, fs_ = tick_stride(cfg), frame_stride(cfg.fps)
+    ks = pair_frame_indices(t, cfg.num_pairs, ts_, fs_)
     unique_ks = list(dict.fromkeys(ks))
     pvs = {}
     for k in unique_ks:
         prepared = prepare_frames(
-            [_load_frame(EPISODE, TICK_STRIDE * k), _load_frame(EPISODE, TICK_STRIDE * k + FRAME_STRIDE)],
+            [_load_frame(EPISODE, ts_ * k), _load_frame(EPISODE, ts_ * k + fs_)],
             cfg,
         )
         pvs[k] = pair_to_pixel_values(processor, prepared, cfg)["pixel_values_videos"]
@@ -116,7 +116,7 @@ def test_feature_parity_batched_vs_streaming(dataset, cfg, model, t):
     """GATING (fp32): dataset's one batched ViT call == streaming sequential encode + front-pad."""
     item = dataset[dataset.samples.index((EPISODE, t))]
     device = model.device
-    k_max = (t - MIN_T) // TICK_STRIDE
+    k_max = (t - frame_stride(cfg.fps)) // tick_stride(cfg)
     rows = cfg.grid_h * cfg.grid_w
     n_unique = item["pixel_values"].shape[0] // rows
     per_pair = item["pixel_values"].view(n_unique, rows, -1)

@@ -7,10 +7,12 @@ window is left-padded by repeating the OLDEST pair, i.e. [pair_0 x (15-k), pairs
 import pytest
 import torch
 
-from streaming_qwen_vlm.training.dataset import MIN_T, pair_frame_indices
+from streaming_qwen_vlm.training.dataset import frame_stride, pair_frame_indices, tick_stride
 from streaming_qwen_vlm.vision_cache import PairVisionCache
 
 NUM_PAIRS = 15
+# (t_stride, f_stride, num_pairs): run1-style 336/3fps grid and run3-style 224/2fps grid
+GRIDS = [(20, 10, 15), (30, 15, 8)]
 
 
 def _tagged(k: int) -> torch.Tensor:
@@ -42,27 +44,45 @@ def test_cache_empty_raises():
         cache.concat(pad_to_full=True)
 
 
-def test_pair_frame_indices_matches_cache_padding():
-    """The dataloader's index-level padding equals the cache's tensor-level padding."""
-    for t in (MIN_T, 29, 30, 49, 130, 291):
-        ks = pair_frame_indices(t, NUM_PAIRS)
-        assert len(ks) == NUM_PAIRS
-        k_max = (t - MIN_T) // 20
+@pytest.mark.parametrize("t_stride,f_stride,num_pairs", GRIDS)
+def test_pair_frame_indices_matches_cache_padding(t_stride, f_stride, num_pairs):
+    """The dataloader's index-level padding equals the cache's tensor-level padding, per grid."""
+    for t in (f_stride, 29, 30, 49, 130, 291, 400):
+        if t < f_stride:
+            continue
+        ks = pair_frame_indices(t, num_pairs, t_stride, f_stride)
+        assert len(ks) == num_pairs
+        k_max = (t - f_stride) // t_stride
         # simulate streaming: pairs 0..k_max pushed in order, then front-padded
-        cache = PairVisionCache(NUM_PAIRS, tokens_per_pair=1, hidden=1)
+        cache = PairVisionCache(num_pairs, tokens_per_pair=1, hidden=1)
         for k in range(k_max + 1):
             cache.push(torch.tensor([[float(k)]]))
         streamed = cache.concat(pad_to_full=True).view(-1).tolist()
-        expected = [float(min(k, k_max)) for k in ks]  # overflow: cache keeps latest 15
-        if k_max >= NUM_PAIRS:
-            expected = [float(k) for k in range(k_max - NUM_PAIRS + 1, k_max + 1)]
-            assert ks[-1] == k_max and ks == list(range(k_max - NUM_PAIRS + 1, k_max + 1))
+        expected = [float(min(k, k_max)) for k in ks]  # overflow: cache keeps latest num_pairs
+        if k_max >= num_pairs:
+            expected = [float(k) for k in range(k_max - num_pairs + 1, k_max + 1)]
+            assert ks[-1] == k_max and ks == list(range(k_max - num_pairs + 1, k_max + 1))
         assert streamed == expected
 
 
-def test_pair_frame_indices_rejects_early_t():
+@pytest.mark.parametrize("t_stride,f_stride,num_pairs", GRIDS)
+def test_pair_frame_indices_rejects_early_t(t_stride, f_stride, num_pairs):
     with pytest.raises(ValueError):
-        pair_frame_indices(MIN_T - 1, NUM_PAIRS)
+        pair_frame_indices(f_stride - 1, num_pairs, t_stride, f_stride)
+
+
+def test_stride_helpers_match_grids():
+    """frame_stride/tick_stride reproduce both run configs from VLMConfig."""
+    from streaming_qwen_vlm.config import VLMConfig
+
+    run1 = VLMConfig()  # 336, 3 fps, 15 pairs
+    assert (frame_stride(run1.fps), tick_stride(run1)) == (10, 20)
+    run3 = VLMConfig(fixed_resolution=(224, 224), fps=2, num_pairs=8)
+    assert (frame_stride(run3.fps), tick_stride(run3)) == (15, 30)
+    assert run3.tokens_per_pair == 64 and run3.total_video_tokens == 512
+    assert run3.second_per_grid_ts == 1.0 and run3.window_frames == 16
+    with pytest.raises(ValueError):
+        frame_stride(7)  # does not divide 30 Hz
 
 
 def test_collate_dedup_offsets():

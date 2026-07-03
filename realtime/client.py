@@ -182,20 +182,28 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
             cv2.destroyAllWindows()
 
 
-def run_act(client, cam, execute: bool, control_hz: float = 30.0, exec_per_tick: int = 20):
+def run_act(client, cam, execute: bool, meta: dict | None = None):
     """Stage-2 VLA loop against a --checkpoint server (mode 'act').
 
-    30 Hz executor; every ``exec_per_tick`` control steps a tick fires: the 2 newest frames
-    (captured 1/3 s apart, matching the training pair grid) + current state go to the server in a
-    background thread; the previous [30,14] chunk keeps executing meanwhile. On chunk arrival the
-    playback index starts at the request-to-arrival latency in control steps (the 10-action tail is
-    the late-tick buffer). Without --execute, actions are printed, not sent.
+    The capture/execution cadence derives from the SERVER's metadata (fps, frames_per_pair,
+    control_hz), so one client serves any checkpoint config: run1-style (3 fps -> tick every 20
+    control steps) or run3-style (2 fps -> tick every 30). Each tick sends the 2 newest frames
+    (captured 1/fps s apart, matching the training pair grid) + current state in a background
+    thread; the previous chunk keeps executing meanwhile, and the ``min(idx, len-1)`` clamp holds
+    the last action through the fetch gap. Without --execute, actions are printed, not sent.
     """
     import threading
 
+    meta = meta or {}
+    control_hz = float(meta.get("control_hz", 30))
+    fps = int(meta.get("fps", 3))
+    frames_per_pair = int(meta.get("frames_per_pair", 2))
+    frame_gap = int(round(control_hz / fps))          # control steps between the pair's 2 frames
+    exec_per_tick = frames_per_pair * frame_gap       # a new pair completes every tick
+
     period = 1.0 / control_hz
     client.infer({"mode": "reset"})
-    print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz "
+    print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz (fps={fps}) "
           f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'}). Ctrl-C to stop.")
 
     result = {}  # cross-thread: {"resp": dict, "t_sent": float}
@@ -212,7 +220,7 @@ def run_act(client, cam, execute: bool, control_hz: float = 30.0, exec_per_tick:
         i = 0
         while True:
             t_iter = time.perf_counter()
-            if i % exec_per_tick == exec_per_tick // 2:      # mid-tick: capture the pair's first frame
+            if i % exec_per_tick == exec_per_tick - frame_gap:  # capture the pair's first frame
                 frame_a, _ = cam.capture()
             if i % exec_per_tick == 0:                        # tick: capture second frame + state, fire request
                 frame_b, state = cam.capture()
@@ -225,10 +233,11 @@ def run_act(client, cam, execute: bool, control_hz: float = 30.0, exec_per_tick:
                 if resp is not None:
                     late = int(round((time.perf_counter() - result.pop("t_sent")) * control_hz))
                     chunk, idx = np.asarray(resp["actions"]), min(late, 9)
+                    n_pairs = int(meta.get("window_frames", 30)) // frames_per_pair
                     print(f"tick {tick:4d}  rtt={result.pop('rtt'):6.1f}ms  "
                           f"(vis={resp['vision_ms']:.0f} prefill={resp['prefill_ms']:.0f} "
                           f"denoise={resp['denoise_ms']:.0f})  start_idx={idx}  "
-                          f"pairs={resp.get('num_pairs', '?')}/15")
+                          f"pairs={resp.get('num_pairs', '?')}/{n_pairs}")
             if chunk is not None:
                 action = chunk[min(idx, len(chunk) - 1)]
                 idx += 1
@@ -264,13 +273,19 @@ def main():
     meta = getattr(client, "_server_metadata", {})
     print("connected; server metadata:", meta)
 
-    cam = RobotCamera(args.send_res)
+    # The server's checkpoint config decides the capture resolution (falls back to --send_res).
+    send_res = args.send_res
+    if isinstance(meta, dict) and meta.get("fixed_resolution"):
+        send_res = int(meta["fixed_resolution"][0])
+        if send_res != args.send_res:
+            print(f"using server resolution {send_res} (overrides --send_res {args.send_res})")
+    cam = RobotCamera(send_res)
 
     if args.mode == "act":
         if meta.get("serves") != "actions":
             print("WARNING: server is not serving actions — start it with --checkpoint.")
         try:
-            run_act(client, cam, execute=args.execute)
+            run_act(client, cam, execute=args.execute, meta=meta)
         finally:
             cam.close()
         return

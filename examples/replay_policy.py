@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from streaming_qwen_vlm.normalize import load_episode_arrays  # noqa: E402
 from streaming_qwen_vlm.policy import ActPolicy  # noqa: E402
-from streaming_qwen_vlm.training.dataset import FRAME_STRIDE, MIN_T, TICK_STRIDE  # noqa: E402
+from streaming_qwen_vlm.training.dataset import frame_stride, tick_stride  # noqa: E402
 
 
 def main() -> None:
@@ -50,13 +50,17 @@ def main() -> None:
 
     T = len(actions)
     horizon = policy.expert_cfg.horizon
+    # Tick grid derives from the CHECKPOINT's config (meta.json) — run1-style (10/20) and
+    # run3-style (15/30) checkpoints both replay correctly with this one script.
+    f_stride = frame_stride(policy.cfg.fps)
+    t_stride = tick_stride(policy.cfg)
     preds, targets, ticks, mses = [], [], [], []
     policy.reset()
-    for k in range((T - MIN_T) // TICK_STRIDE + 1):
-        t = TICK_STRIDE * k + FRAME_STRIDE
+    for k in range((T - f_stride) // t_stride + 1):
+        t = t_stride * k + f_stride
         if t >= T:
             break
-        pair = np.stack([frame(TICK_STRIDE * k), frame(t)])
+        pair = np.stack([frame(t_stride * k), frame(t)])
         out = policy.act(pair, states[t])
         demo = actions[t : t + horizon]
         if len(demo) < horizon:
@@ -88,7 +92,7 @@ def main() -> None:
             ax = axes[j % 7][j // 7]
             ax.plot(np.arange(T), actions[:, j], "k-", lw=1, label="demo")
             for k, t in enumerate(ticks):
-                seg = preds[k][: max(0, min(TICK_STRIDE, T - t)), j]
+                seg = preds[k][: max(0, min(t_stride, T - t)), j]
                 ax.plot(np.arange(t, t + len(seg)), seg, lw=1, alpha=0.8)
             ax.set_title(f"joint {j}", fontsize=8)
         axes[0][0].legend()
