@@ -88,11 +88,18 @@ def check_dataset():
     print("dataset OK" if ok else "DATASET INCOMPLETE — re-run `modal volume put`")
 
 
+# The wandb secret must be attached UNCONDITIONALLY: a conditional here makes the local function
+# definition and the remote container disagree on object count ("N dependencies but got N+1 object
+# ids"). Create it once with `modal secret create wandb WANDB_API_KEY=...`; training still runs
+# fine without a valid key (it falls back to metrics.jsonl).
+WANDB_SECRET = modal.Secret.from_name("wandb")
+
+
 @app.function(
     gpu="H200",
     volumes=VOLUMES,
     timeout=24 * 60 * 60,           # up to 24 h; use --detach so it survives disconnects
-    secrets=[modal.Secret.from_name("wandb")] if os.environ.get("MODAL_HAVE_WANDB") else [],
+    secrets=[WANDB_SECRET],
 )
 def train(args: str = ""):
     """Clone the repo at GIT_REF and run training/train.py with `args` (a single string)."""

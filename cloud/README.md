@@ -8,9 +8,9 @@ persisted to a Modal Volume. See `modal_train.py` for the image/entrypoints.
 ```bash
 pip install modal
 modal setup                                            # browser auth
-# optional: wandb logging (else it falls back to metrics.jsonl on the volume)
+# wandb logging: create the secret once (training still runs without a valid key -> metrics.jsonl).
+# The 'wandb' secret is always attached, so this MUST exist before running train/smoke.
 modal secret create wandb WANDB_API_KEY=<your-key>
-export MODAL_HAVE_WANDB=1                               # so train() attaches the secret
 ```
 
 Make sure the repo is pushed — Modal clones `github.com/ZJU-Walker/qwen.git` at `main`:
