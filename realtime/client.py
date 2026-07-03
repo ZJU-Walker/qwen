@@ -21,7 +21,17 @@ from collections import deque
 
 import numpy as np
 
-LEROBOT_FORK_PATH = "/home/iris/lerobot"  # default; override with --lerobot-path
+# ========================= EDIT THESE FOR THE ROBOT RUN ========================= #
+# Set once here and run `python realtime/client.py` with NO flags (act mode). CLI
+# flags still exist and override these if you pass them.
+SERVER_IP = "iris-hgx-1"          # the GPU box running realtime/server.py --checkpoint ...
+SERVER_PORT = 8000
+LEROBOT_FORK_PATH = "/home/iris/lerobot"   # path to the lerobot Trossen fork on THIS robot machine
+EXECUTE = False                   # False = dry run (prints actions, no motion); True = actuate
+GRAVITY_COMP_TIME = 5.0           # seconds to hand-place both arms before actuation (execute only)
+MAX_ACTION_DELTA = 0.15           # max abs joint move per control step (rad) — rate limit
+# ================================================================================ #
+
 MODES = ["cached", "full"]
 LAYERS = [8, 16, 36]
 WINDOW_FRAMES = 30
@@ -297,14 +307,15 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
 
 
 def main():
+    # Defaults come from the CONFIG BLOCK at the top of this file, so `python realtime/client.py`
+    # runs act mode with no flags. Flags still override when passed.
     ap = argparse.ArgumentParser()
-    ap.add_argument("--policy_host", required=True, help="H200 server host")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--mode", default="cached", choices=["cached", "full", "sweep", "act"],
-                    help="cached/full = live feature loop; sweep = timed table over modes x layers; "
-                         "act = VLA action-chunk execution against a --checkpoint server")
-    ap.add_argument("--execute", action="store_true",
-                    help="act mode: actually send actions to the robot (default: dry-run print)")
+    ap.add_argument("--policy_host", default=SERVER_IP, help="server host (default: SERVER_IP const)")
+    ap.add_argument("--port", type=int, default=SERVER_PORT)
+    ap.add_argument("--mode", default="act", choices=["cached", "full", "sweep", "act"],
+                    help="act (default) = VLA action execution; cached/full = feature loop; sweep = table")
+    ap.add_argument("--execute", action="store_true", default=EXECUTE,
+                    help="act mode: actually send actions (default from EXECUTE const; dry-run prints)")
     ap.add_argument("--layers", type=int, default=16, help="early-exit depth for live mode")
     ap.add_argument("--no_viz", action="store_true", help="live mode: print latency only, no window")
     ap.add_argument("--steps", type=int, default=50, help="sweep mode: timed steps per cell")
@@ -313,16 +324,16 @@ def main():
                     help="capture resolution (overridden by the server's checkpoint resolution)")
     ap.add_argument("--lerobot-path", default=LEROBOT_FORK_PATH,
                     help="path to the lerobot Trossen fork on this robot machine")
-    ap.add_argument("--gravity-comp-time", type=float, default=5.0,
-                    help="act+execute: seconds of gravity-comp warmup to hand-place the arms "
-                         "(incl. the static left arm) before actuation; 0 to skip")
-    ap.add_argument("--max-action-delta", type=float, default=0.15,
-                    help="act+execute: max abs joint move per control step (rad); rate-limits "
-                         "absolute-position targets so they can't jump")
+    ap.add_argument("--gravity-comp-time", type=float, default=GRAVITY_COMP_TIME,
+                    help="act+execute: seconds of gravity-comp warmup to hand-place the arms")
+    ap.add_argument("--max-action-delta", type=float, default=MAX_ACTION_DELTA,
+                    help="act+execute: max abs joint move per control step (rad)")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
 
+    print(f"connecting to {args.policy_host}:{args.port} (mode={args.mode}, "
+          f"execute={args.execute})")
     client = websocket_client_policy.WebsocketClientPolicy(host=args.policy_host, port=args.port)
     meta = getattr(client, "_server_metadata", {})
     print("connected; server metadata:", meta)
