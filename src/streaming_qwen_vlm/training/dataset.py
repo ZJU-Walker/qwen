@@ -15,6 +15,13 @@ chunk). The same normalized chunk feeds the flow target and the FAST/AR targets.
 Frames go through the exact ``prepare_frames`` + ``pair_to_pixel_values`` calls the streaming
 server uses. The FAST tokenizer is lazily constructed per dataloader worker (trust_remote_code
 objects are not reliably picklable).
+
+ViT dedup: ``pixel_values`` holds each sample's UNIQUE pairs only, plus a ``slot_map`` [num_pairs]
+that expands their embeddings into the 15 window slots (vla.forward_train gathers). Episodes here
+(<= 209 frames) never contain more than 10 unique pairs at any t (mean ~5), so encoding all 15
+slots would re-run the ViT on front-pad duplicates ~3x for nothing. The gather is mathematically
+identical to encoding duplicates: gradients through repeated slots sum into the single encode by
+linearity.
 """
 
 from __future__ import annotations
@@ -109,15 +116,18 @@ class TrossenActDataset(Dataset):
         arrs = self.arrays[ep]
         cfg = self.cfg
 
-        # 1. Visual window: distinct pairs processed once, front-pad by repeating the tensor.
+        # 1. Visual window: UNIQUE pairs only (chronological); slot_map expands them into the
+        #    15 window slots downstream (front-pad = repeated slot 0, never a repeated encode).
         ks = pair_frame_indices(t, cfg.num_pairs)
+        unique_ks = list(dict.fromkeys(ks))  # order-preserving == chronological
         pv_by_k: Dict[int, torch.Tensor] = {}
-        for k in dict.fromkeys(ks):  # unique, order-preserving
+        for k in unique_ks:
             fa = self._load_frame(ep, TICK_STRIDE * k)
             fb = self._load_frame(ep, TICK_STRIDE * k + FRAME_STRIDE)
             prepared = prepare_frames([fa, fb], cfg)
             pv_by_k[k] = pair_to_pixel_values(self.processor, prepared, cfg)["pixel_values_videos"]
-        pixel_values = torch.cat([pv_by_k[k] for k in ks], dim=0)  # [num_pairs*576, 1176] f32
+        pixel_values = torch.cat([pv_by_k[k] for k in unique_ks], dim=0)  # [n_unique*576, 1176] f32
+        slot_map = torch.tensor([unique_ks.index(k) for k in ks], dtype=torch.long)  # [num_pairs]
 
         # 2. State -> bins -> constant-length token ids.
         bins = discretize(arrs["state"][t], self.state_stats, bins=cfg.state_bins)
@@ -136,6 +146,7 @@ class TrossenActDataset(Dataset):
 
         return {
             "pixel_values": pixel_values,
+            "slot_map": slot_map,
             "state_ids": state_ids,
             "fast_input_ids": fast_input_ids,
             "ar_targets": ar_targets,
@@ -147,10 +158,17 @@ class TrossenActDataset(Dataset):
 
 def collate(batch: List[Dict[str, torch.Tensor]], cfg: VLMConfig) -> Dict[str, torch.Tensor]:
     B = len(batch)
-    grid = torch.tensor(cfg.pair_grid_thw, dtype=torch.long).unsqueeze(0).repeat(B * cfg.num_pairs, 1)
+    # Variable unique-pair counts per sample: cat the unique pixel rows, and offset each sample's
+    # slot_map so it indexes into the batch-global list of encoded pairs.
+    rows_per_pair = cfg.grid_h * cfg.grid_w  # pre-merge patch rows per pair (576 at 336x336)
+    n_unique = [b["pixel_values"].shape[0] // rows_per_pair for b in batch]
+    offsets = torch.tensor([0] + n_unique[:-1], dtype=torch.long).cumsum(0)
+    grid = torch.tensor(cfg.pair_grid_thw, dtype=torch.long).unsqueeze(0).repeat(sum(n_unique), 1)
     return {
-        "pixel_values": torch.cat([b["pixel_values"] for b in batch], dim=0),  # [B*P*576, 1176]
-        "video_grid_thw": grid,                                                # [B*P, 3]
+        "pixel_values": torch.cat([b["pixel_values"] for b in batch], dim=0),  # [N_u*576, 1176]
+        "video_grid_thw": grid,                                                # [N_u, 3]
+        "slot_map": torch.stack([b["slot_map"] + off                           # [B, P] -> rows of
+                                 for b, off in zip(batch, offsets)]),          #   the N_u encodes
         "state_ids": torch.stack([b["state_ids"] for b in batch]),             # [B, 56]
         "fast_input_ids": torch.stack([b["fast_input_ids"] for b in batch]),   # [B, T_fast]
         "ar_targets": torch.stack([b["ar_targets"] for b in batch]),           # [B, T_fast+1]

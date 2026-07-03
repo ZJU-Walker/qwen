@@ -129,10 +129,16 @@ class QwenVLA(nn.Module):
         B = batch["state_ids"].shape[0]
         T_fast = batch["fast_input_ids"].shape[1]
 
-        # 1. Vision, in-graph (D8: the ViT trains). Batched per-pair grid rows are structurally
-        #    per-pair-equivalent (blocked attention); NOT PairVisionCache.encode_pair (inference_mode).
+        # 1. Vision, in-graph (D8: the ViT trains). batch["pixel_values"] holds each sample's
+        #    UNIQUE pairs only; batch["slot_map"] [B, num_pairs] gathers the embeddings into the
+        #    window slots (episodes are shorter than the window, so front-pad duplicates would
+        #    otherwise ~3x the ViT work). The gather is mathematically identical to encoding
+        #    duplicates — repeated-slot grads sum into the single encode by linearity. Batched
+        #    per-pair grid rows stay structurally per-pair-equivalent (blocked attention); NOT
+        #    PairVisionCache.encode_pair (inference_mode).
         feats = self.backbone.get_video_features(batch["pixel_values"], batch["video_grid_thw"])
-        video_embeds = torch.cat(list(feats), dim=0).view(B, self.cfg.total_video_tokens, -1)
+        feats = torch.stack(list(feats))                     # [N_unique_total, 144, 2048]
+        video_embeds = feats[batch["slot_map"]].reshape(B, self.cfg.total_video_tokens, -1)
 
         # 2. Sequence: [constant prefix w/ fresh state ids | FAST tail].
         prefix_embeds = self.build_prefix_embeds(batch["state_ids"], video_embeds)

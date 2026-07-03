@@ -14,6 +14,7 @@ import functools
 import json
 import math
 import os
+import tempfile
 import time
 from typing import Dict
 
@@ -58,8 +59,22 @@ def _lr_lambda(step: int, warmup: int, total: int, final_frac: float) -> float:
     return final_frac + (1.0 - final_frac) * 0.5 * (1.0 + math.cos(math.pi * min(p, 1.0)))
 
 
+def _configure_tmp_dir(tmp_dir: str | None) -> str:
+    """Keep multiprocessing temp files off NFS-backed home/project mounts."""
+    path = tmp_dir or os.environ.get("QWEN_VLA_TMPDIR") or os.path.join(
+        "/tmp", f"qwen3vl-{os.getuid()}"
+    )
+    os.makedirs(path, exist_ok=True)
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[name] = path
+    tempfile.tempdir = path
+    return path
+
+
 def main() -> None:
     tc = parse_args()
+    tmp_dir = _configure_tmp_dir(tc.tmp_dir)
+    print(f"[train] tmp_dir={tmp_dir}")
     os.makedirs(tc.out_dir, exist_ok=True)
     torch.manual_seed(tc.seed)
     np.random.seed(tc.seed)

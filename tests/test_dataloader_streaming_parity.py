@@ -74,17 +74,27 @@ def _load_frame(ep: int, idx: int) -> np.ndarray:
 def test_pixel_and_lowdim_parity(dataset, cfg, processor, t):
     item = dataset[dataset.samples.index((EPISODE, t))]
 
-    # --- pixels: bit-exact vs an independent rebuild over the streaming pair grid ---
+    # --- pixels: dataset stores UNIQUE pairs + slot_map; the slot expansion must be bit-exact
+    # vs an independent rebuild over the streaming pair grid (duplicates included) ---
     ks = pair_frame_indices(t, cfg.num_pairs)
+    unique_ks = list(dict.fromkeys(ks))
     pvs = {}
-    for k in dict.fromkeys(ks):
+    for k in unique_ks:
         prepared = prepare_frames(
             [_load_frame(EPISODE, TICK_STRIDE * k), _load_frame(EPISODE, TICK_STRIDE * k + FRAME_STRIDE)],
             cfg,
         )
         pvs[k] = pair_to_pixel_values(processor, prepared, cfg)["pixel_values_videos"]
+    rows = cfg.grid_h * cfg.grid_w
+    assert item["pixel_values"].shape[0] == len(unique_ks) * rows, (
+        f"t={t}: a duplicate pair got re-encoded ({item['pixel_values'].shape[0]} rows, "
+        f"{len(unique_ks)} unique pairs)")
+    assert item["slot_map"].tolist() == [unique_ks.index(k) for k in ks], f"t={t}: slot_map wrong"
+    assert torch.equal(item["pixel_values"], torch.cat([pvs[k] for k in unique_ks], dim=0)), (
+        f"t={t}: unique pixel tensors differ")
+    expanded = item["pixel_values"].view(len(unique_ks), rows, -1)[item["slot_map"]]
     expected = torch.cat([pvs[k] for k in ks], dim=0)
-    assert torch.equal(item["pixel_values"], expected), f"t={t}: pixel tensors differ"
+    assert torch.equal(expanded.reshape(expected.shape), expected), f"t={t}: slot expansion differs"
 
     # --- state bins ---
     arrs = load_episode_arrays(ROOT, EPISODE)
@@ -106,27 +116,26 @@ def test_feature_parity_batched_vs_streaming(dataset, cfg, model, t):
     """GATING (fp32): dataset's one batched ViT call == streaming sequential encode + front-pad."""
     item = dataset[dataset.samples.index((EPISODE, t))]
     device = model.device
-    ks = pair_frame_indices(t, cfg.num_pairs)
     k_max = (t - MIN_T) // TICK_STRIDE
-    per_pair = item["pixel_values"].view(cfg.num_pairs, -1, item["pixel_values"].shape[-1])
+    rows = cfg.grid_h * cfg.grid_w
+    n_unique = item["pixel_values"].shape[0] // rows
+    per_pair = item["pixel_values"].view(n_unique, rows, -1)
     grid1 = torch.tensor([list(cfg.pair_grid_thw)], dtype=torch.long)
-    grid_all = torch.tensor([list(cfg.pair_grid_thw)] * cfg.num_pairs, dtype=torch.long)
+    grid_all = torch.tensor([list(cfg.pair_grid_thw)] * n_unique, dtype=torch.long)
 
     @torch.inference_mode()
     def encode_both():
         # Streaming: sequential per-pair encode + front-padded concat (the deployment path).
         cache = PairVisionCache(cfg.num_pairs, cfg.tokens_per_pair)
-        seen = set()
-        for k, pv in zip(ks, per_pair):
-            if k in seen:
-                continue
-            seen.add(k)
+        for pv in per_pair:  # dataset uniques are chronological == streaming push order
             cache.push(cache.encode_pair(model, pv, grid1))  # keep the tower's compute dtype
-        assert len(cache) == min(k_max + 1, cfg.num_pairs)
+        assert len(cache) == min(k_max + 1, cfg.num_pairs) == n_unique
         streamed = cache.concat(pad_to_full=True)  # [2160, 2048]
-        # Dataset/training: ONE batched ViT call over all 15 grid rows.
+        # Dataset/training: ONE batched ViT call over the unique pairs, slot-gathered.
         feats = model.get_video_features(item["pixel_values"].to(device), grid_all.to(device))
-        return streamed, torch.cat(list(feats), dim=0)
+        feats = torch.stack(list(feats))  # [n_unique, 144, 2048]
+        batched = feats[item["slot_map"].to(device)].reshape(cfg.total_video_tokens, -1)
+        return streamed, batched
 
     # bf16 diff is logged only: kernel accumulation gives max-abs O(1) at cosine ~0.999 on these
     # large-magnitude features (cf. Stage-1 test #2: bf16 max ~7.8 vs fp32 max ~1.4e-4).

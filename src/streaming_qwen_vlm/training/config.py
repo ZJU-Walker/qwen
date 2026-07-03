@@ -48,6 +48,7 @@ class TrainConfig:
     save_every: int = 2_000
     keep_last: int = 3
     out_dir: str = "checkpoints/run1"
+    tmp_dir: Optional[str] = None             # local scratch for multiprocessing temp files
     wandb_project: str = "qwen-vla"
     run_name: Optional[str] = None
     resume: bool = False                    # resume from <out_dir>/latest

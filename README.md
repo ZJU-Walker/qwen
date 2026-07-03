@@ -115,7 +115,10 @@ Implements the locked design in `claude_plan.md` (D1–D8), π0.5-faithful:
 - **FAST side-car** (`fast_tokens.py`, `vla.py`): Qwen vocab NOT resized (tied embeddings);
   FAST ids live at `V_BASE+` with separate `fast_embed`/`fast_head`; `L = L_AR + L_flow`.
 - **Data** (`training/dataset.py`): any control step t≥10; pair grid = frames (20k, 20k+10);
-  windows front-padded identically to streaming; chunks `a[t:t+30]` hold-pose padded.
+  windows front-padded identically to streaming; chunks `a[t:t+30]` hold-pose padded. Unique
+  pairs are ViT-encoded once per sample and gathered into window slots via `slot_map` (episodes
+  are shorter than the 15-pair window, so this cuts vision compute ~3x; gradients identical by
+  linearity).
 - **Deviations from claude_plan.md** (deliberate): vocab side-car instead of resize; hold-pose
   padding instead of loss masks; EMA on expert only; t≥10 sampling floor; adaRMS final norm.
 
