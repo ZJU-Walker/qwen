@@ -61,6 +61,37 @@ class RobotCamera:
 
         self.robot.send_action(torch.from_numpy(np.asarray(action, dtype=np.float32)))
 
+    def gravity_comp_warmup(self, duration: float = 5.0):
+        """Torque-off the follower arms (gravity-comp mode) so the operator can hand-place them,
+        then latch + lock the chosen pose. Ports openpi's eval_real_RTC_working_warmup.py:
+        Torque_Enable=0 = external-effort/gravity-comp on the Trossen fork (arm is back-drivable
+        but holds against gravity); on lock we re-enable torque at the current Present_Position.
+        Returns the locked [14] pose so the caller can seed rate-limiting from it.
+        """
+        import time
+
+        if duration <= 0:
+            return None
+        for arm in self.robot.follower_arms.values():
+            arm.write("Torque_Enable", 0)
+        end = time.monotonic() + duration
+        last = None
+        print(f"GRAVITY-COMP: move the arms to the desired start pose ({duration:.0f}s)...")
+        while time.monotonic() < end:
+            rem = max(0, int(np.ceil(end - time.monotonic())))
+            if rem != last:
+                print(f"  choose initial pose: {rem}s remaining", flush=True)
+                last = rem
+            time.sleep(0.05)
+        locked = []
+        for name, arm in self.robot.follower_arms.items():
+            pos = arm.read("Present_Position").astype(np.float32)
+            arm.write("Torque_Enable", 1)
+            arm.write("Goal_Position", pos)
+            locked.append(pos)
+            print(f"  locked {name} at {np.round(pos, 4).tolist()}")
+        return np.concatenate(locked).astype(np.float32)
+
     def close(self):
         self.robot.disconnect()
 
@@ -182,7 +213,8 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
             cv2.destroyAllWindows()
 
 
-def run_act(client, cam, execute: bool, meta: dict | None = None):
+def run_act(client, cam, execute: bool, meta: dict | None = None,
+            gravity_comp_time: float = 5.0, max_action_delta: float = 0.15):
     """Stage-2 VLA loop against a --checkpoint server (mode 'act').
 
     The capture/execution cadence derives from the SERVER's metadata (fps, frames_per_pair,
@@ -190,7 +222,13 @@ def run_act(client, cam, execute: bool, meta: dict | None = None):
     control steps) or run3-style (2 fps -> tick every 30). Each tick sends the 2 newest frames
     (captured 1/fps s apart, matching the training pair grid) + current state in a background
     thread; the previous chunk keeps executing meanwhile, and the ``min(idx, len-1)`` clamp holds
-    the last action through the fetch gap. Without --execute, actions are printed, not sent.
+    the last action through the fetch gap.
+
+    Safety (ported from openpi eval_real_RTC_working_warmup.py): with --execute, a gravity-comp
+    warmup lets the operator hand-place BOTH follower arms (incl. the static left arm) at the start
+    pose before actuation; then every commanded action is rate-limited so absolute-position targets
+    can't jump more than ``max_action_delta`` rad/control-step. Without --execute, actions are
+    printed, not sent (and the warmup is skipped).
     """
     import threading
 
@@ -202,6 +240,8 @@ def run_act(client, cam, execute: bool, meta: dict | None = None):
     exec_per_tick = frames_per_pair * frame_gap       # a new pair completes every tick
 
     period = 1.0 / control_hz
+    # Warmup FIRST (arms back-drivable), then reset the server cache and start streaming.
+    last_action = cam.gravity_comp_warmup(gravity_comp_time) if execute else None
     client.infer({"mode": "reset"})
     print(f"ACT loop: tick every {exec_per_tick} steps @ {control_hz:.0f} Hz (fps={fps}) "
           f"({'EXECUTING' if execute else 'dry run — pass --execute to actuate'}). Ctrl-C to stop.")
@@ -242,6 +282,11 @@ def run_act(client, cam, execute: bool, meta: dict | None = None):
                 action = chunk[min(idx, len(chunk) - 1)]
                 idx += 1
                 if execute:
+                    # Rate-limit: clip the per-control-step move so a bad absolute target can't jump.
+                    if last_action is not None:
+                        delta = np.clip(action - last_action, -max_action_delta, max_action_delta)
+                        action = (last_action + delta).astype(np.float32)
+                    last_action = action
                     cam.act(action)
                 elif i % exec_per_tick == 0:
                     print(f"    action[0:4]={np.round(action[:4], 3).tolist()} ...")
@@ -268,6 +313,12 @@ def main():
                     help="capture resolution (overridden by the server's checkpoint resolution)")
     ap.add_argument("--lerobot-path", default=LEROBOT_FORK_PATH,
                     help="path to the lerobot Trossen fork on this robot machine")
+    ap.add_argument("--gravity-comp-time", type=float, default=5.0,
+                    help="act+execute: seconds of gravity-comp warmup to hand-place the arms "
+                         "(incl. the static left arm) before actuation; 0 to skip")
+    ap.add_argument("--max-action-delta", type=float, default=0.15,
+                    help="act+execute: max abs joint move per control step (rad); rate-limits "
+                         "absolute-position targets so they can't jump")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
@@ -288,7 +339,9 @@ def main():
         if meta.get("serves") != "actions":
             print("WARNING: server is not serving actions — start it with --checkpoint.")
         try:
-            run_act(client, cam, execute=args.execute, meta=meta)
+            run_act(client, cam, execute=args.execute, meta=meta,
+                    gravity_comp_time=args.gravity_comp_time,
+                    max_action_delta=args.max_action_delta)
         finally:
             cam.close()
         return
