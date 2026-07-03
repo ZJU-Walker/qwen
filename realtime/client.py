@@ -28,6 +28,7 @@ SERVER_IP = "iris-hgx-1"          # the GPU box running realtime/server.py --che
 SERVER_PORT = 8000
 LEROBOT_FORK_PATH = "/home/iris/lerobot"   # path to the lerobot Trossen fork on THIS robot machine
 EXECUTE = False                   # False = dry run (prints actions, no motion); True = actuate
+VIZ = True                        # show the 16-frame window window (big current pair + 4x4 grid)
 CONTROL_FREQ = 30.0               # send/execute rate in Hz (dt = 1/CONTROL_FREQ)
 ACTIONS_PER_CHUNK = 20            # how many of the [horizon=30, 14] chunk to run before re-requesting
 GRAVITY_COMP_TIME = 5.0           # seconds to hand-place both arms before actuation (execute only)
@@ -225,9 +226,82 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
             cv2.destroyAllWindows()
 
 
+class WindowViz:
+    """Mirror of the server's rolling window: a client-side deque of the last `window_frames`
+    frames captured, rendered as the big current pair on top + a 4x4 grid of all 16 below.
+
+    Purely visual (the client still only SENDS 2 frames/tick; the server caches the rest). Newest
+    pair is boxed in the grid. Call push(a, b) each tick, then draw(overlay_lines); q closes it.
+    """
+
+    def __init__(self, window_frames: int, cols: int = 4, big: int = 384, cell: int = 160):
+        import cv2
+
+        self.cv2 = cv2
+        self.window_frames = window_frames
+        self.cols = cols
+        self.rows = (window_frames + cols - 1) // cols
+        self.big, self.cell = big, cell
+        self.frames = deque(maxlen=window_frames)  # RGB uint8, oldest..newest
+        self.win = "qwen window (sent to server)"
+
+    def push(self, frame_a, frame_b):
+        self.frames.append(np.asarray(frame_a, dtype=np.uint8))
+        self.frames.append(np.asarray(frame_b, dtype=np.uint8))
+
+    def draw(self, overlay_lines=None) -> bool:
+        """Render one frame; returns False if the user pressed q (to stop)."""
+        cv2 = self.cv2
+        if not self.frames:
+            return True
+        frames = list(self.frames)
+        # front-pad the display to a full window like the server does (repeat oldest)
+        while len(frames) < self.window_frames:
+            frames.insert(0, frames[0])
+
+        def bgr(f, size):
+            return cv2.resize(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), (size, size),
+                              interpolation=cv2.INTER_NEAREST)
+
+        # top: the current (newest) pair, large
+        top = np.hstack([bgr(frames[-2], self.big), bgr(frames[-1], self.big)])
+        cv2.putText(top, "current pair (sent this tick)", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+        # bottom: 4x4 grid of all 16, newest two boxed
+        cells = []
+        for i, f in enumerate(frames):
+            c = bgr(f, self.cell)
+            if i >= self.window_frames - 2:  # newest pair
+                cv2.rectangle(c, (1, 1), (self.cell - 2, self.cell - 2), (0, 255, 0), 3)
+            cv2.putText(c, str(i), (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            cells.append(c)
+        rows = [np.hstack(cells[r * self.cols:(r + 1) * self.cols]) for r in range(self.rows)]
+        grid = np.vstack(rows)
+
+        # align widths and stack
+        W = max(top.shape[1], grid.shape[1])
+        def padw(img):
+            if img.shape[1] < W:
+                img = np.hstack([img, np.zeros((img.shape[0], W - img.shape[1], 3), np.uint8)])
+            return img
+        canvas = np.vstack([padw(top), padw(grid)])
+
+        for k, line in enumerate(overlay_lines or []):
+            y = 58 + k * 26  # overlay sits below the "current pair" caption on the big top row
+            cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1, cv2.LINE_AA)
+
+        cv2.imshow(self.win, canvas)
+        return (cv2.waitKey(1) & 0xFF) != ord("q")
+
+    def close(self):
+        self.cv2.destroyAllWindows()
+
+
 def run_act(client, cam, execute: bool, meta: dict | None = None,
             gravity_comp_time: float = 5.0, max_action_delta: float = 0.15,
-            control_freq: float = 30.0, actions_per_chunk: int = 20):
+            control_freq: float = 30.0, actions_per_chunk: int = 20, viz: bool = False):
     """Stage-2 VLA loop against a --checkpoint server (mode 'act').
 
     Cadence is EXPLICIT (top-of-file constants), decoupled from the training grid:
@@ -253,13 +327,17 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
     frame_gap_s = 1.0 / fps                 # real-time gap between the pair's two frames
     dt = 1.0 / control_freq
 
+    window_frames = int(meta.get("window_frames", 16))
+    viewer = WindowViz(window_frames) if viz else None
     last_action = cam.gravity_comp_warmup(gravity_comp_time) if execute else None
     client.infer({"mode": "reset"})
     print(f"ACT loop: horizon={horizon}, executing {actions_per_chunk}/chunk @ {control_freq:.0f} Hz "
-          f"({'EXECUTING' if execute else 'DRY RUN — prints only'}). Ctrl-C to stop.")
+          f"({'EXECUTING' if execute else 'DRY RUN — prints only'}){' +viz' if viz else ''}. "
+          f"Ctrl-C{' or q in window' if viz else ''} to stop.")
 
     result = {}  # cross-thread handoff from the request thread
     lock = threading.Lock()
+    last_meta = {"rtt": 0.0, "vis": 0.0, "prefill": 0.0, "denoise": 0.0, "pairs": "?"}
 
     def request(frames, state):
         t0 = time.perf_counter()
@@ -272,7 +350,19 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
         frame_a, _ = cam.capture()
         time.sleep(frame_gap_s)
         frame_b, state = cam.capture()
+        if viewer is not None:
+            viewer.push(frame_a, frame_b)  # mirror the sent pair into the client-side window
         return np.stack([frame_a, frame_b]), state
+
+    def show():
+        if viewer is None:
+            return True
+        lines = [f"tick {tick}  {control_freq:.0f}Hz  exec {actions_per_chunk}/{horizon}  "
+                 f"{'EXEC' if execute else 'DRY'}",
+                 f"rtt {last_meta['rtt']:.0f}ms  vis {last_meta['vis']:.0f}  "
+                 f"prefill {last_meta['prefill']:.0f}  denoise {last_meta['denoise']:.0f}  "
+                 f"pairs {last_meta['pairs']}"]
+        return viewer.draw(lines)
 
     chunk, pending, tick = None, False, 0
     try:
@@ -285,6 +375,8 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
                 rtt = result.pop("rtt", None)
             if resp is not None:
                 chunk, pending, tick = np.asarray(resp["actions"]), False, tick + 1
+                last_meta = {"rtt": rtt, "vis": resp["vision_ms"], "prefill": resp["prefill_ms"],
+                             "denoise": resp["denoise_ms"], "pairs": resp.get("num_pairs", "?")}
                 print(f"tick {tick:4d}  rtt={rtt:6.1f}ms  (vis={resp['vision_ms']:.0f} "
                       f"prefill={resp['prefill_ms']:.0f} denoise={resp['denoise_ms']:.0f})  "
                       f"pairs={resp.get('num_pairs', '?')}")
@@ -306,6 +398,8 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
                     cam.act(action)
                 elif idx == 0:
                     print(f"    action[0:4]={np.round(action[:4], 3).tolist()} ...")
+                if not show():
+                    raise KeyboardInterrupt
                 time.sleep(max(0.0, dt - (time.perf_counter() - t_step)))
 
             # If the next chunk hasn't arrived, hold the last action until it does.
@@ -315,9 +409,14 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
                         break          # arrived; the top-of-loop handler will consume it
                 if execute and last_action is not None:
                     cam.act(last_action)
+                if not show():
+                    raise KeyboardInterrupt
                 time.sleep(dt)
     except KeyboardInterrupt:
         print("\nstopped.")
+    finally:
+        if viewer is not None:
+            viewer.close()
 
 
 def main():
@@ -346,6 +445,10 @@ def main():
                     help="act: send/execute rate in Hz")
     ap.add_argument("--actions-per-chunk", type=int, default=ACTIONS_PER_CHUNK,
                     help="act: how many of the chunk to execute before requesting the next")
+    ap.add_argument("--viz", dest="viz", action="store_true", default=VIZ,
+                    help="act: show the 16-frame window (big current pair + 4x4 grid)")
+    ap.add_argument("--no-viz-act", dest="viz", action="store_false",
+                    help="act: disable the window (headless)")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
@@ -372,7 +475,8 @@ def main():
                     gravity_comp_time=args.gravity_comp_time,
                     max_action_delta=args.max_action_delta,
                     control_freq=args.control_freq,
-                    actions_per_chunk=args.actions_per_chunk)
+                    actions_per_chunk=args.actions_per_chunk,
+                    viz=args.viz)
         finally:
             cam.close()
         return
