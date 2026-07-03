@@ -21,7 +21,7 @@ from collections import deque
 
 import numpy as np
 
-LEROBOT_FORK_PATH = "/home/iris/lerobot"
+LEROBOT_FORK_PATH = "/home/iris/lerobot"  # default; override with --lerobot-path
 MODES = ["cached", "full"]
 LAYERS = [8, 16, 36]
 WINDOW_FRAMES = 30
@@ -32,9 +32,9 @@ RESULTS_PATH = "realtime/results_realtime.md"
 class RobotCamera:
     """cam_high capture via the lerobot Trossen fork (lazy import)."""
 
-    def __init__(self, send_res: int):
-        if LEROBOT_FORK_PATH not in sys.path:
-            sys.path.insert(0, LEROBOT_FORK_PATH)
+    def __init__(self, send_res: int, lerobot_path: str = LEROBOT_FORK_PATH):
+        if lerobot_path not in sys.path:
+            sys.path.insert(0, lerobot_path)
         from lerobot.common.robot_devices.robots.configs import TrossenAISoloRobotConfig
         from lerobot.common.robot_devices.robots.utils import make_robot_from_config
 
@@ -264,7 +264,10 @@ def main():
     ap.add_argument("--no_viz", action="store_true", help="live mode: print latency only, no window")
     ap.add_argument("--steps", type=int, default=50, help="sweep mode: timed steps per cell")
     ap.add_argument("--warmup", type=int, default=18, help=">=15 fills the cached pair-cache")
-    ap.add_argument("--send_res", type=int, default=336)
+    ap.add_argument("--send_res", type=int, default=336,
+                    help="capture resolution (overridden by the server's checkpoint resolution)")
+    ap.add_argument("--lerobot-path", default=LEROBOT_FORK_PATH,
+                    help="path to the lerobot Trossen fork on this robot machine")
     args = ap.parse_args()
 
     from openpi_client import websocket_client_policy
@@ -279,7 +282,7 @@ def main():
         send_res = int(meta["fixed_resolution"][0])
         if send_res != args.send_res:
             print(f"using server resolution {send_res} (overrides --send_res {args.send_res})")
-    cam = RobotCamera(send_res)
+    cam = RobotCamera(send_res, lerobot_path=args.lerobot_path)
 
     if args.mode == "act":
         if meta.get("serves") != "actions":
