@@ -227,48 +227,80 @@ def run_live(client, cam, mode, layers, send_res, no_viz=False):
 
 
 class WindowViz:
-    """Mirror of the server's rolling window: a client-side deque of the last `window_frames`
-    frames captured, rendered as the big current pair on top + a 4x4 grid of all 16 below.
+    """Background-threaded mirror of the server's rolling window.
 
-    Purely visual (the client still only SENDS 2 frames/tick; the server caches the rest). Newest
-    pair is boxed in the grid. Call push(a, b) each tick, then draw(overlay_lines); q closes it.
+    The CONTROL LOOP only calls push()/update_overlay() — lock-protected numpy writes, ~zero cost,
+    and it NEVER touches cv2. A daemon thread owns ALL OpenCV calls (GUI calls are not thread-safe)
+    and redraws the big-current-pair + 4x4-grid canvas at ~15 fps from the latest snapshot, polling
+    waitKey for 'q'. This decouples rendering from CONTROL_FREQ, so a slow imshow (e.g. over X11
+    forwarding) can never stall the control loop. Check should_stop() for the 'q' keypress.
     """
 
-    def __init__(self, window_frames: int, cols: int = 4, big: int = 384, cell: int = 160):
-        import cv2
+    def __init__(self, window_frames: int, cols: int = 4, big: int = 384, cell: int = 160,
+                 fps: float = 15.0):
+        import threading
 
-        self.cv2 = cv2
         self.window_frames = window_frames
         self.cols = cols
         self.rows = (window_frames + cols - 1) // cols
         self.big, self.cell = big, cell
-        self.frames = deque(maxlen=window_frames)  # RGB uint8, oldest..newest
         self.win = "qwen window (sent to server)"
+        self._period = 1.0 / fps
+        self._lock = threading.Lock()
+        self._frames = deque(maxlen=window_frames)  # RGB uint8, oldest..newest
+        self._overlay = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
+    # --- called from the control loop (cheap, no cv2) ---
     def push(self, frame_a, frame_b):
-        self.frames.append(np.asarray(frame_a, dtype=np.uint8))
-        self.frames.append(np.asarray(frame_b, dtype=np.uint8))
+        with self._lock:
+            self._frames.append(np.asarray(frame_a, dtype=np.uint8))
+            self._frames.append(np.asarray(frame_b, dtype=np.uint8))
 
-    def draw(self, overlay_lines=None) -> bool:
-        """Render one frame; returns False if the user pressed q (to stop)."""
-        cv2 = self.cv2
-        if not self.frames:
-            return True
-        frames = list(self.frames)
-        # front-pad the display to a full window like the server does (repeat oldest)
-        while len(frames) < self.window_frames:
+    def update_overlay(self, lines):
+        with self._lock:
+            self._overlay = list(lines)
+
+    def should_stop(self) -> bool:
+        return self._stop.is_set()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    # --- render thread: owns every cv2 call ---
+    def _run(self):
+        import time as _time
+
+        import cv2
+
+        while not self._stop.is_set():
+            t0 = _time.perf_counter()
+            with self._lock:
+                frames = list(self._frames)
+                overlay = list(self._overlay)
+            if frames:
+                cv2.imshow(self.win, self._build(cv2, frames, overlay))
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    self._stop.set()
+                    break
+            _time.sleep(max(0.0, self._period - (_time.perf_counter() - t0)))
+        cv2.destroyAllWindows()
+
+    def _build(self, cv2, frames, overlay):
+        while len(frames) < self.window_frames:  # front-pad like the server (repeat oldest)
             frames.insert(0, frames[0])
 
         def bgr(f, size):
             return cv2.resize(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), (size, size),
                               interpolation=cv2.INTER_NEAREST)
 
-        # top: the current (newest) pair, large
         top = np.hstack([bgr(frames[-2], self.big), bgr(frames[-1], self.big)])
         cv2.putText(top, "current pair (sent this tick)", (10, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-        # bottom: 4x4 grid of all 16, newest two boxed
         cells = []
         for i, f in enumerate(frames):
             c = bgr(f, self.cell)
@@ -279,7 +311,6 @@ class WindowViz:
         rows = [np.hstack(cells[r * self.cols:(r + 1) * self.cols]) for r in range(self.rows)]
         grid = np.vstack(rows)
 
-        # align widths and stack
         W = max(top.shape[1], grid.shape[1])
         def padw(img):
             if img.shape[1] < W:
@@ -287,16 +318,11 @@ class WindowViz:
             return img
         canvas = np.vstack([padw(top), padw(grid)])
 
-        for k, line in enumerate(overlay_lines or []):
-            y = 58 + k * 26  # overlay sits below the "current pair" caption on the big top row
+        for k, line in enumerate(overlay):
+            y = 58 + k * 26
             cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1, cv2.LINE_AA)
-
-        cv2.imshow(self.win, canvas)
-        return (cv2.waitKey(1) & 0xFF) != ord("q")
-
-    def close(self):
-        self.cv2.destroyAllWindows()
+        return canvas
 
 
 def run_act(client, cam, execute: bool, meta: dict | None = None,
@@ -355,14 +381,17 @@ def run_act(client, cam, execute: bool, meta: dict | None = None,
         return np.stack([frame_a, frame_b]), state
 
     def show():
+        """Cheap: push the overlay text to the render thread and report if 'q' was pressed.
+        The render thread does all cv2 work off the control loop, so this never blocks."""
         if viewer is None:
             return True
-        lines = [f"tick {tick}  {control_freq:.0f}Hz  exec {actions_per_chunk}/{horizon}  "
-                 f"{'EXEC' if execute else 'DRY'}",
-                 f"rtt {last_meta['rtt']:.0f}ms  vis {last_meta['vis']:.0f}  "
-                 f"prefill {last_meta['prefill']:.0f}  denoise {last_meta['denoise']:.0f}  "
-                 f"pairs {last_meta['pairs']}"]
-        return viewer.draw(lines)
+        viewer.update_overlay([
+            f"tick {tick}  {control_freq:.0f}Hz  exec {actions_per_chunk}/{horizon}  "
+            f"{'EXEC' if execute else 'DRY'}",
+            f"rtt {last_meta['rtt']:.0f}ms  vis {last_meta['vis']:.0f}  "
+            f"prefill {last_meta['prefill']:.0f}  denoise {last_meta['denoise']:.0f}  "
+            f"pairs {last_meta['pairs']}"])
+        return not viewer.should_stop()
 
     chunk, pending, tick = None, False, 0
     try:
